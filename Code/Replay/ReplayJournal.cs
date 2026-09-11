@@ -106,7 +106,9 @@ internal sealed class ReplayJournal : IDisposable
 
     // Highest `s` already in the file, or -1 when it is new or unreadable. Reads the tail only;
     // journals reach hundreds of KB and this runs on the run-start path.
-    private static long LastSequence(string path)
+    // Also used by the crash-recovery scan, which appends its marker from outside the writer
+    // and so has no sequence state of its own.
+    internal static long LastSequence(string path)
     {
         try
         {
@@ -125,6 +127,11 @@ internal sealed class ReplayJournal : IDisposable
                 var at = line.IndexOf("\"s\":", StringComparison.Ordinal);
                 if (at < 0) continue;
                 var start = at + 4;
+                // Tolerate whitespace after the colon. The writer never emits it, so this costs
+                // nothing in practice, but without it any journal not produced by this writer
+                // silently reads as "no sequence" and the caller restarts from 0. That is how a
+                // hand-written test fixture fooled me into thinking the recovery fix had failed.
+                while (start < line.Length && char.IsWhiteSpace(line[start])) start++;
                 var end = start;
                 while (end < line.Length && char.IsDigit(line[end])) end++;
                 if (end > start && long.TryParse(line.Substring(start, end - start), out var v) && v > best)

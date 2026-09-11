@@ -531,8 +531,18 @@ public static class ReplayRecorder
                 // recovery marker included. Terminate the fragment first when the file does not
                 // already end on a newline.
                 if (!EndsWithNewline(file)) File.AppendAllText(file, "\n");
+                // Carry a sequence number. Every other line in every journal has one, and this
+                // was the single exception, because the scan appends from outside the writer
+                // that owns the counter. A consumer keying on (run, s) hit a missing field on
+                // exactly the line that says the capture is broken, and a contiguity check saw
+                // a hole at the end of any recovered file. Read the tail for the highest s the
+                // same way reopening a journal does.
+                //
+                // No ms, floor or act, deliberately: there is no clock and no position out here,
+                // and inventing them is worse than their absence.
+                var seq = ReplayJournal.LastSequence(file) + 1;
                 File.AppendAllText(file,
-                    "{\"t\":\"end\",\"terminal_reason\":\"interrupted\"," +
+                    "{\"t\":\"end\",\"s\":" + seq + ",\"terminal_reason\":\"interrupted\"," +
                     "\"capture_status\":\"truncated\"}\n");
                 MainFile.Logger.Info($"replay: recovered {Path.GetFileName(file)} (interrupted)");
             }
