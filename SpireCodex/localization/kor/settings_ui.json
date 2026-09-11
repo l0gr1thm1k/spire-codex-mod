@@ -3,6 +3,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "도전 추적",
   "SPIRECODEX-UPLOAD_RUNS.title": "완료한 도전을 spire-codex.com에 업로드",
   "SPIRECODEX-BACKFILL_HISTORY.title": "기존 과거 도전도 함께 업로드 (1회)",
+  "SPIRECODEX-RECORD_REPLAYS.title": "각 런의 상세 리플레이를 내 PC에 기록",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "해당 리플레이도 업로드해 런 페이지에서 재생",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "플레이 중 진행 중인 도전을 웹사이트에 표시",
   "SPIRECODEX-OVERLAY.title": "오버레이 & 인게임 UI",
   "SPIRECODEX-SHOW_DECK_VIEW.title": "동반자 오버레이 패널 표시",

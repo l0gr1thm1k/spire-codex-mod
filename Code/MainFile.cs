@@ -52,6 +52,11 @@ public partial class MainFile : Node
         // ticker that PresencePublisher ships with each heartbeat.
         Core.RunEvents.Apply(harmony);
 
+        // Run replay recorder: opens a per-run NDJSON journal and recovers any journal a
+        // previous crash left unterminated. Must run before the first NoteRun tick.
+        Replay.ReplayRecorder.Start();
+        Replay.ReplayHooks.Apply(harmony);
+
         // Per-hit damage tracking off the game's damage hooks; feeds the combat damage meter,
         // the live snapshot's combat block, and the run-upload damage summary.
         Core.DamageTracker.Apply(harmony);

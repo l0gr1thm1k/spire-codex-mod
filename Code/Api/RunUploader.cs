@@ -98,10 +98,15 @@ public sealed class RunUploader : IDisposable
             }
             foreach (var path in held) _ = Upload(path);
             if (Config.BackfillOnce) _ = BackfillAsync(root);
+            _ = Replay.ReplayUploader.SweepAsync();
         };
 
         // One-time backfill of existing history, off the main thread.
         if (Config.BackfillOnce) _ = BackfillAsync(root);
+
+        // Journals stranded on disk: recorded while uploads were off, or whose upload failed
+        // with nothing to re-trigger it. Runs every launch, cheap when there is nothing to do.
+        _ = Replay.ReplayUploader.SweepAsync();
     }
 
     // Manual "Backfill past runs" trigger for the F5 Settings tab. Runs the same history upload as
@@ -155,6 +160,9 @@ public sealed class RunUploader : IDisposable
             // unchanged. No-op when nothing was tracked.
             var payload = Core.DamageTracker.AttachTo(json);
 
+            // SpireCodexClient retries 429 and every 5xx internally with Retry-After and
+            // backoff, so there is deliberately no second retry loop here — stacking them
+            // would turn one bad minute into 25 attempts.
             var result = await _client
                 .UploadRunAsync(payload, Config.SteamId, Config.Username, _sts2Version)
                 .ConfigureAwait(false);
@@ -163,13 +171,35 @@ public sealed class RunUploader : IDisposable
                      $"{(result.Success ? "ok" : "FAILED")} ({result.StatusCode}) " +
                      $"{Truncate(result.Body, 200)}");
 
-            if (result.Success) RecordUploaded(Path.GetFullPath(path)); // so a later backfill skips it
+            if (result.Success)
+            {
+                RecordUploaded(Path.GetFullPath(path)); // so a later backfill skips it
 
-            // Pop the post-run shareable card for live completions (not backfill), with this
-            // run's damage summary line when we tracked any.
-            if (result.Success && ParseUploadResponse(result.Body) is { Hash: not null } up)
-                Ui.RunCompleteCard.ShowRunDeferred(
-                    up.Url ?? Config.RunUrl(up.Hash!), up.RankLine, Core.DamageTracker.RunCardLine());
+                // Then the replay, if there is one and the player opted in. Strictly after the
+                // .run: the replay endpoint 404s until the run doc exists, and the hash comes
+                // from THIS response rather than being computed locally, which is what keeps
+                // co-op landing on the uploader's own slot.
+                if (ParseUploadResponse(result.Body) is { Hash: not null } r)
+                    await Replay.ReplayUploader.TryUploadAsync(json, r.Hash).ConfigureAwait(false);
+            }
+            else
+            {
+                // Keep the run eligible. Leaving it out of the ledger AND out of _dispatched
+                // means the next backfill still finds it, instead of the run being marked
+                // handled and lost for good after one failed request.
+                _dispatched.Remove(Path.GetFullPath(path));
+                // And say so on screen. A silent failure looked exactly like the feature not
+                // firing: the only symptom of a lost run was the post-run card never appearing.
+                Ui.RunCompleteCard.ShowFailedDeferred(result.StatusCode);
+            }
+
+            if (result.Success)
+            {
+                var up = ParseUploadResponse(result.Body);
+                if (up.Hash != null)
+                    Ui.RunCompleteCard.ShowRunDeferred(
+                        up.Url ?? Config.RunUrl(up.Hash), up.RankLine, Core.DamageTracker.RunCardLine());
+            }
         }
         catch (Exception e)
         {

@@ -193,6 +193,8 @@ public static class Sts2Access
             }
         }
         localPlayer ??= firstPlayer; // fallback if the local net id wasn't matched (e.g. pre-lobby)
+        LivePlayer = localPlayer; // the replay recorder needs the live CardModel objects, not ids
+        LiveRunState = state;     // and the run's own identity (StringSeed / StartTime) for the header
 
         snap.PlayerCount = snap.Players.Count;
         if (localPlayer != null && localIndex < snap.Players.Count)
@@ -684,6 +686,16 @@ public static class Sts2Access
         foreach (var _ in e) n++;
         return n;
     }
+
+    // The live local Player object from the most recent read. The snapshot flattens cards to
+    // ids, but the replay recorder has to mint instance ids off the actual CardModel objects,
+    // so it needs the player itself. Null outside a run.
+    internal static object? LivePlayer { get; private set; }
+
+    // The live IRunState from the most recent read. The replay header has to carry the SAME
+    // identity the .run file does, because the upload endpoint validates seed + start_time +
+    // character against the run doc.
+    internal static object? LiveRunState { get; private set; }
 
     private static List<DeckEntry> ReadDeck(object player) => ReadCardList(Reflect.GetMember(player, "Deck"));
 

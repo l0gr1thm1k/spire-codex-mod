@@ -32,6 +32,12 @@ public partial class RunCompleteCard : CanvasLayer
     public static void ShowRunDeferred(string url, string? rankLine = null, string? damageLine = null)
         => Callable.From(() => _instance?.ShowRun(url, rankLine, damageLine)).CallDeferred();
 
+    // The upload failed after the client exhausted its retries. Shown because a silent failure
+    // is indistinguishable from the feature not firing: the only symptom of a lost run used to
+    // be this card never appearing, which nobody can act on.
+    public static void ShowFailedDeferred(int statusCode)
+        => Callable.From(() => _instance?.ShowFailed(statusCode)).CallDeferred();
+
     public override void _Ready()
     {
         _instance = this;
@@ -103,6 +109,19 @@ public partial class RunCompleteCard : CanvasLayer
             $"[color=#ffd34d][b]{Loc.T("rc_run_tracked")}[/b][/color]\n" +
             Loc.T("rc_live_on") + "\n" +
             $"[color=#8fd0ff]{url}[/color]" + rank + damage;
+        Visible = true;
+        _showing = true;
+        _elapsed = 0;
+    }
+
+    public void ShowFailed(int statusCode)
+    {
+        if (!SpireCodexConfig.ShowPostRunCard) return;
+        _url = ""; // nothing to open or copy
+        _text.Text =
+            $"[color=#ff9a7a][b]{Loc.T("rc_upload_failed")}[/b][/color]\n" +
+            $"[color=#c8ccd2]{Loc.T("rc_will_retry")}[/color]" +
+            (statusCode > 0 ? $"  [color=#5b636c]({statusCode})[/color]" : "");
         Visible = true;
         _showing = true;
         _elapsed = 0;

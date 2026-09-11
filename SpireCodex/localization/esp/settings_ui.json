@@ -4,6 +4,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "Seguimiento de partidas",
   "SPIRECODEX-UPLOAD_RUNS.title": "Sube tus partidas terminadas a spire-codex.com",
   "SPIRECODEX-BACKFILL_HISTORY.title": "Sube también tus partidas anteriores existentes (una sola vez)",
+  "SPIRECODEX-RECORD_REPLAYS.title": "Graba una repetición detallada de cada partida en tu equipo",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "Sube también esas repeticiones para que la página de tu partida pueda reproducirlas",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "Muestra tu partida en vivo en el sitio web mientras juegas",
 
   "SPIRECODEX-OVERLAY.title": "Overlay e interfaz en el juego",

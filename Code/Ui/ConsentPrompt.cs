@@ -3,17 +3,28 @@ using SpireCodex.Api;
 
 namespace SpireCodex.Ui;
 
-// The first-upload disclosure (M3-C trust gate). Watches for "uploads enabled but consent
-// never answered" and pops a centered native-styled card explaining exactly what gets
-// uploaded, with Allow / Not now. Allow persists the grant (Consent.Grant, which also lets
-// RunUploader flush held runs); Not now flips the UploadRuns toggle back off and saves the
-// config, so re-enabling it in settings re-asks.
+// The upload disclosure (M3-C trust gate). One card, two modes:
+//
+//  - Onboarding, when nobody has answered yet (or uploads were switched on in settings without
+//    a grant): the full "what gets uploaded" body with Turn on / Keep off. Turn on persists the
+//    grant, which also lets RunUploader flush held runs; Keep off flips UploadRuns back off and
+//    saves, so re-enabling in settings re-asks.
+//
+//  - Re-disclosure, when someone granted against an OLDER disclosure than the current one.
+//    Consent.Answered is sticky for the life of a machine, so without this mode a change to
+//    what we collect would apply silently to every existing player. Their run uploads are not
+//    interrupted and their grant is not reset; the card just says what is new, and the newer
+//    data stays held until they answer it. Added when replays shipped: agreeing to "completed
+//    runs (character, deck, relics, score, seed, result)" in v1.0.10 is not agreement to a
+//    per-decision journal of how you play.
 public partial class ConsentPrompt : CanvasLayer
 {
     private static ConsentPrompt? _instance;
 
     private PanelContainer _panel = null!;
     private RichTextLabel _body = null!;
+    private HBoxContainer _onboardRow = null!;
+    private HBoxContainer _redisclosureRow = null!;
     private double _sinceCheck;
 
     public static void Start()
@@ -67,9 +78,9 @@ public partial class ConsentPrompt : CanvasLayer
         _body.Text = Loc.T("consent_body");
         vbox.AddChild(_body);
 
-        var row = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.End };
-        row.AddThemeConstantOverride("separation", 10);
-        vbox.AddChild(row);
+        _onboardRow = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.End };
+        _onboardRow.AddThemeConstantOverride("separation", 10);
+        vbox.AddChild(_onboardRow);
 
         var turnOn = new Button { Text = Loc.T("consent_turnon") };
         turnOn.Pressed += () =>
@@ -80,18 +91,53 @@ public partial class ConsentPrompt : CanvasLayer
             Consent.Grant();
             MainFile.Logger.Info("run tracking turned on");
         };
-        row.AddChild(turnOn);
+        _onboardRow.AddChild(turnOn);
 
         var keepOff = new Button { Text = Loc.T("consent_keepoff") };
         keepOff.Pressed += () =>
         {
             Visible = false;
             SpireCodexConfig.UploadRuns = false;
+            // Turn replays off too, not just leave them inert. UploadReplays ships on so a
+            // player who says yes gets them without a second question, but "Keep off" has to
+            // leave the settings menu telling the truth: an Upload replays toggle reading ON
+            // while nothing uploads is worse than the toggle being wrong. Turning run tracking
+            // back on later re-asks, and that card names replays.
+            SpireCodexConfig.UploadReplays = false;
             BaseLib.Config.ModConfigRegistry.Get<SpireCodexConfig>()?.Save();
             Consent.Decline();
-            MainFile.Logger.Info("run tracking kept off");
+            MainFile.Logger.Info("run tracking kept off; replay uploads off");
         };
-        row.AddChild(keepOff);
+        _onboardRow.AddChild(keepOff);
+
+        _redisclosureRow = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.End };
+        _redisclosureRow.AddThemeConstantOverride("separation", 10);
+        vbox.AddChild(_redisclosureRow);
+
+        var replaysOn = new Button { Text = Loc.T("consent_replays_ok") };
+        replaysOn.Pressed += () =>
+        {
+            Visible = false;
+            SpireCodexConfig.UploadReplays = true;
+            BaseLib.Config.ModConfigRegistry.Get<SpireCodexConfig>()?.Save();
+            Consent.AcknowledgeDisclosure();
+            MainFile.Logger.Info("replay uploads accepted");
+        };
+        _redisclosureRow.AddChild(replaysOn);
+
+        // Declining replays leaves run uploads exactly as they were. Recording to disk also
+        // stays on, so the player can change their mind later without having lost the runs in
+        // between; the sweep picks them up when the toggle goes back on.
+        var replaysOff = new Button { Text = Loc.T("consent_replays_off") };
+        replaysOff.Pressed += () =>
+        {
+            Visible = false;
+            SpireCodexConfig.UploadReplays = false;
+            BaseLib.Config.ModConfigRegistry.Get<SpireCodexConfig>()?.Save();
+            Consent.AcknowledgeDisclosure();
+            MainFile.Logger.Info("replay uploads declined; run uploads unchanged");
+        };
+        _redisclosureRow.AddChild(replaysOff);
 
         Visible = false;
     }
@@ -105,13 +151,17 @@ public partial class ConsentPrompt : CanvasLayer
         // Show the onboarding choice once (until the player answers), AND re-show the
         // disclosure if they later enable uploads in settings without having granted. Once
         // granted, never again; once "Keep off" with uploads off, the condition is false.
-        if (!Consent.Granted && (!Consent.Answered || Config.UploadRuns))
-        {
-            // Resolve the language now (the card is built at boot, possibly before the game's
-            // LocManager was ready) and re-apply the body text before showing.
-            Loc.Refresh();
-            _body.Text = Loc.T("consent_body");
-            Visible = true;
-        }
+        var onboarding = !Consent.Granted && (!Consent.Answered || Config.UploadRuns);
+        // Re-disclosure only matters to someone already granted, and only until they answer it.
+        var redisclose = !onboarding && Consent.NeedsRedisclosure;
+        if (!onboarding && !redisclose) return;
+
+        // Resolve the language now (the card is built at boot, possibly before the game's
+        // LocManager was ready) and re-apply the body text before showing.
+        Loc.Refresh();
+        _body.Text = Loc.T(onboarding ? "consent_body" : "consent_replays_body");
+        _onboardRow.Visible = onboarding;
+        _redisclosureRow.Visible = redisclose;
+        Visible = true;
     }
 }

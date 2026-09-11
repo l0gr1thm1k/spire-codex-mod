@@ -4,6 +4,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "การติดตามการเดินทาง",
   "SPIRECODEX-UPLOAD_RUNS.title": "อัปโหลดการเดินทางที่จบแล้วของคุณไปยัง spire-codex.com",
   "SPIRECODEX-BACKFILL_HISTORY.title": "อัปโหลดการเดินทางในอดีตที่มีอยู่ของคุณด้วย (ครั้งเดียว)",
+  "SPIRECODEX-RECORD_REPLAYS.title": "บันทึกรีเพลย์แบบละเอียดของแต่ละรันลงในเครื่องของคุณ",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "อัปโหลดรีเพลย์เหล่านั้นด้วย เพื่อให้หน้ารันเล่นย้อนหลังได้",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "แสดงการเดินทางแบบสดของคุณบนเว็บไซต์ขณะที่คุณเล่น",
 
   "SPIRECODEX-OVERLAY.title": "โอเวอร์เลย์ & UI ในเกม",

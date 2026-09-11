@@ -167,11 +167,41 @@ internal static class RoomExport
         }
     }
 
+    // Loc entries whose GetFormattedText() does not resolve, so we stop calling them.
+    //
+    // Some event descriptions interpolate variables the LocString has not been given
+    // ("Gain {SoloGold} Gold", "{Enchantment1}"). Formatting those THROWS, and the game's own
+    // LocManager logs a multi-line ERROR with a stack trace before the exception reaches us.
+    // This runs from the 10 Hz producer tick, so a single event screen was emitting the same
+    // engine error several times a second for as long as the player stood on it.
+    //
+    // Only failures are remembered, never successes: descriptions carry run-specific rolled
+    // values, so caching a resolved string could serve a stale number. A key that failed once
+    // in this session fails identically every time, and skipping it costs nothing.
+    private static readonly HashSet<string> _unresolvable = new();
+
     // A LocString resolves its localized text only through GetFormattedText(); its
     // ToString() is unhelpful. Null/empty -> null so the payload omits it.
     private static string? LocText(object? locString)
     {
+        if (locString == null) return null;
+
+        // Identity is (table, entry key); reading those does no formatting and cannot throw.
+        var table = Reflect.GetString(locString, "LocTable");
+        var key = Reflect.GetString(locString, "LocEntryKey");
+        var id = table != null && key != null ? table + "|" + key : null;
+        if (id != null)
+        {
+            lock (_unresolvable)
+                if (_unresolvable.Contains(id)) return null;
+        }
+
         var s = Reflect.CallString(locString, "GetFormattedText");
-        return string.IsNullOrWhiteSpace(s) ? null : s;
+        if (!string.IsNullOrWhiteSpace(s)) return s;
+
+        if (id != null)
+            lock (_unresolvable)
+                _unresolvable.Add(id);
+        return null;
     }
 }

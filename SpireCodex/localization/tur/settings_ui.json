@@ -3,6 +3,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "Oyun Takibi",
   "SPIRECODEX-UPLOAD_RUNS.title": "Tamamlanan oyunlarını spire-codex.com'a yükle",
   "SPIRECODEX-BACKFILL_HISTORY.title": "Mevcut geçmiş oyunlarını da yükle (bir kez)",
+  "SPIRECODEX-RECORD_REPLAYS.title": "Her koşunun ayrıntılı tekrarını kendi bilgisayarına kaydet",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "Bu tekrarları da yükle, böylece koşu sayfan onları oynatabilsin",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "Sen oynarken canlı oyununu web sitesinde göster",
   "SPIRECODEX-OVERLAY.title": "Bindirme ve Oyun İçi Arayüz",
   "SPIRECODEX-SHOW_DECK_VIEW.title": "Eşlikçi bindirme panelini göster",

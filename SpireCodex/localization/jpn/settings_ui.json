@@ -3,6 +3,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "プレイ記録",
   "SPIRECODEX-UPLOAD_RUNS.title": "完了したプレイを spire-codex.com にアップロード",
   "SPIRECODEX-BACKFILL_HISTORY.title": "既存の過去のプレイもアップロード（一度だけ）",
+  "SPIRECODEX-RECORD_REPLAYS.title": "各ランの詳細なリプレイを自分のPCに記録する",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "そのリプレイもアップロードしてランページで再生できるようにする",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "プレイ中の進行状況をウェブサイトに表示",
   "SPIRECODEX-OVERLAY.title": "オーバーレイとゲーム内UI",
   "SPIRECODEX-SHOW_DECK_VIEW.title": "コンパニオンのオーバーレイパネルを表示",

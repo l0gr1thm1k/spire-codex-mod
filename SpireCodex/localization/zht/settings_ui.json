@@ -3,6 +3,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "對局記錄",
   "SPIRECODEX-UPLOAD_RUNS.title": "將你已完成的對局上傳到 spire-codex.com",
   "SPIRECODEX-BACKFILL_HISTORY.title": "同時上傳你已有的歷史對局（僅一次）",
+  "SPIRECODEX-RECORD_REPLAYS.title": "在本機記錄每場對局的詳細重播",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "同時上傳這些重播，讓對局頁面可以播放",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "在你遊玩時於網站上展示你的即時對局",
   "SPIRECODEX-OVERLAY.title": "覆蓋層與遊戲內介面",
   "SPIRECODEX-SHOW_DECK_VIEW.title": "顯示助手覆蓋面板",

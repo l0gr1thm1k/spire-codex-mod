@@ -3,6 +3,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "Rastreamento de Partidas",
   "SPIRECODEX-UPLOAD_RUNS.title": "Envie suas partidas concluídas para spire-codex.com",
   "SPIRECODEX-BACKFILL_HISTORY.title": "Também enviar suas partidas antigas existentes (uma vez)",
+  "SPIRECODEX-RECORD_REPLAYS.title": "Gravar uma repetição detalhada de cada run no seu computador",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "Enviar também essas repetições para a página do run poder reproduzi-las",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "Mostrar sua partida ao vivo no site enquanto você joga",
   "SPIRECODEX-OVERLAY.title": "Sobreposição & Interface no Jogo",
   "SPIRECODEX-SHOW_DECK_VIEW.title": "Mostrar o painel de sobreposição companheiro",

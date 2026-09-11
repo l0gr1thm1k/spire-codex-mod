@@ -40,7 +40,11 @@ public sealed class SpireCodexClient
                 var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                 var code = (int)resp.StatusCode;
-                if ((code == 429 || code == 502 || code == 503 || code == 504) && attempt < UploadMaxRetries)
+                // ANY 5xx, not just 502/503/504. A Cloudflare 520 ("origin returned an unknown
+                // error") slipped through that narrower list and silently lost a real run when
+                // the API restarted mid-deploy. 5xx is the server's problem by definition and is
+                // always worth another attempt; 4xx is a genuine rejection and never is.
+                if ((code == 429 || code >= 500) && attempt < UploadMaxRetries)
                 {
                     await Task.Delay(RetryDelay(resp, attempt)).ConfigureAwait(false);
                     continue;
@@ -75,6 +79,55 @@ public sealed class SpireCodexClient
                 return wait < TimeSpan.FromSeconds(60) ? wait : TimeSpan.FromSeconds(60);
         }
         return TimeSpan.FromSeconds(Math.Min(30, 1 << attempt));
+    }
+
+    // POST a gzipped NDJSON replay to /api/runs/{run_hash}/replay.
+    //
+    // The body is ONE complete gzip member with its trailer (a single GZipStream, closed once),
+    // never concatenated members: the server streams the decompression and rejects anything
+    // else as 400 not_gzip. Auth is required here, unlike the run upload — a replay is a much
+    // richer fingerprint than a run summary and must not be spoofable onto someone else's run.
+    //
+    // Status meanings the caller acts on: 404 the run doc does not exist yet (upload the .run
+    // first, retry later), 409 the run already has a different replay or the header disagrees
+    // with the run, 413 over the size caps, 503 storage trouble (retry later).
+    public async Task<RunUploadResult> UploadReplayAsync(string runHash, byte[] gzip)
+    {
+        var url = $"{Config.ApiBase}/runs/{Uri.EscapeDataString(runHash)}/replay";
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var content = new ByteArrayContent(gzip);
+                content.Headers.ContentType =
+                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-ndjson");
+                content.Headers.ContentEncoding.Add("gzip");
+                using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+                if (!string.IsNullOrEmpty(SteamAuth.Token))
+                    req.Headers.Authorization =
+                        new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", SteamAuth.Token);
+                using var resp = await Http.SendAsync(req).ConfigureAwait(false);
+                var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                var code = (int)resp.StatusCode;
+                // Same policy as the run upload: 429 and every 5xx are the server's problem.
+                if ((code == 429 || code >= 500) && attempt < UploadMaxRetries)
+                {
+                    await Task.Delay(RetryDelay(resp, attempt)).ConfigureAwait(false);
+                    continue;
+                }
+                return new RunUploadResult(resp.IsSuccessStatusCode, code, body);
+            }
+            catch (Exception e)
+            {
+                if (attempt < UploadMaxRetries)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(15, 1 << attempt))).ConfigureAwait(false);
+                    continue;
+                }
+                return new RunUploadResult(false, 0, e.Message);
+            }
+        }
     }
 
     // GET /api/runs/scores/{entityType}[?character=] -> { "ENTITY_ID": {score, win_rate,

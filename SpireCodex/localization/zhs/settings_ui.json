@@ -4,6 +4,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "对局记录",
   "SPIRECODEX-UPLOAD_RUNS.title": "将你已完成的对局上传到 spire-codex.com",
   "SPIRECODEX-BACKFILL_HISTORY.title": "同时上传你已有的历史对局（仅一次）",
+  "SPIRECODEX-RECORD_REPLAYS.title": "在本机记录每场对局的详细回放",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "同时上传这些回放，让对局页面可以播放",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "在你游玩时于网站上展示你的实时对局",
 
   "SPIRECODEX-OVERLAY.title": "覆盖层与游戏内界面",

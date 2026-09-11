@@ -4,6 +4,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "Отслеживание вылазок",
   "SPIRECODEX-UPLOAD_RUNS.title": "Загружать завершенные вылазки на spire-codex.com",
   "SPIRECODEX-BACKFILL_HISTORY.title": "Также загрузить ваши прошлые вылазки (один раз)",
+  "SPIRECODEX-RECORD_REPLAYS.title": "Записывать подробный повтор каждого забега на вашем компьютере",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "Также загружать эти повторы, чтобы страница забега могла их воспроизводить",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "Показывать текущую вылазку на сайте во время игры",
 
   "SPIRECODEX-OVERLAY.title": "Оверлей и внутриигровой интерфейс",

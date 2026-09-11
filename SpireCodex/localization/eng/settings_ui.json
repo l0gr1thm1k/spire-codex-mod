@@ -4,6 +4,8 @@
   "SPIRECODEX-RUN_TRACKING.title": "Run Tracking",
   "SPIRECODEX-UPLOAD_RUNS.title": "Upload your finished runs to spire-codex.com",
   "SPIRECODEX-BACKFILL_HISTORY.title": "Also upload your existing past runs (one time)",
+  "SPIRECODEX-RECORD_REPLAYS.title": "Record a detailed replay of each run on your own machine",
+  "SPIRECODEX-UPLOAD_REPLAYS.title": "Also upload those replays so your run page can play them back",
   "SPIRECODEX-SHARE_LIVE_STATUS.title": "Show your live run on the website while you play",
 
   "SPIRECODEX-OVERLAY.title": "Overlay & In-Game UI",

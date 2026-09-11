@@ -63,6 +63,9 @@ public partial class LiveStateProducer : Node
         Api.CodexScores.EnsureCharacter(snapshot.InRun ? snapshot.Character : null);
         // Apply the stat bracket chosen in settings (no-op unless it changed).
         Api.CodexScores.SetFilter(SpireCodexConfig.StatsFilterKey);
+        // Replay journal lifecycle: opens on a new seed, closes when the run ends. No-op
+        // unless the seed changed, so this is cheap at 10 Hz.
+        Replay.ReplayRecorder.NoteRun(snapshot);
         SnapshotWriter.Write(snapshot);
     }
 }

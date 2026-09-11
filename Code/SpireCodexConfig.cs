@@ -21,6 +21,19 @@ public sealed class SpireCodexConfig : SimpleModConfig
     // One-time backfill of existing local run history once uploads are enabled.
     public static bool BackfillHistory { get; set; } = true;
 
+    // Record a detailed replay of each run to disk: every decision, every card played, every
+    // floor. Local only in this build (%APPDATA%/SpireCodex/replays/); nothing is sent
+    // anywhere. Roughly 400 KB per run before compression, and the recorder writes on its own
+    // thread so it does not touch frame time.
+    public static bool RecordReplays { get; set; } = true;
+
+    // Send those replays to spire-codex.com so the run page can play them back. On by default,
+    // but it does nothing on its own: it needs UploadRuns AND a consent grant given against a
+    // disclosure that mentions replays (Consent.ReplaysGranted). Anyone who consented before
+    // replays existed keeps uploading runs and is shown the newer card once before any replay
+    // leaves the machine.
+    public static bool UploadReplays { get; set; } = true;
+
     // Show your in-progress run on the site's live view while you play. Heartbeats every
     // ~30s; needs upload consent + Steam sign-in, and nothing is sent outside a run.
     public static bool ShareLiveStatus { get; set; } = true;
