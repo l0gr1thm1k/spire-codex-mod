@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -236,6 +237,17 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDamageReceived", me, nameof(DamageReceived));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPowerAmountChanged", me, nameof(PowerChanged));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterBlockGained", me, nameof(BlockGained));
+        // No first-party hook exists for either of these, so they patch game internals by name
+        // and degrade to "that line stops appearing" if a patch renames them.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MonsterMoveStateMachine"),
+            "RollMove", me, nameof(MoveRolled), 3, postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState"),
+            "PerformMove", me, nameof(MovePerformed), 1);
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CreatureCmd"),
+            "Heal", me, nameof(Healed), 3);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterCurrentHpChanged", me, nameof(HpChanged));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterGoldGained", me, nameof(GoldGained));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterOrbChanneled", me, nameof(OrbChanneled));
@@ -424,6 +436,53 @@ internal static class ReplayHooks
         }
         catch { }
     }
+
+    // A rolled move, keyed to the monster that rolled it.
+    //
+    // The game has NO move or intent hook, and neither MoveState nor MonsterMoveStateMachine
+    // carries an owner: only RollMove(targets, owner, rng) ever sees both. So the owner is
+    // latched at roll time and read back when the move actually performs. Weak keys, so a
+    // move the game drops is collected normally.
+    private static readonly ConditionalWeakTable<object, object> MoveOwners = new();
+
+    // MonsterMoveStateMachine.RollMove(targets, owner, rng) -> MoveState. Postfix: the only
+    // point where a move and its monster are both in scope.
+    private static void MoveRolled(object __result, object __1)
+    {
+        try
+        {
+            if (__result == null || __1 == null) return;
+            MoveOwners.Remove(__result);
+            MoveOwners.Add(__result, __1);
+        }
+        catch { }
+    }
+
+    // MoveState.PerformMove(targets). Emitted BEFORE the hits and powers it causes, so a
+    // consumer reads "monster did X" then the consequences.
+    private static void MovePerformed(object __instance)
+    {
+        try
+        {
+            if (!MoveOwners.TryGetValue(__instance, out var owner)) return;
+            var intents = Enumerate(Reflect.GetMember(__instance, "Intents"))
+                .Select(i => Reflect.GetMember(i, "IntentType")?.ToString()?.ToLowerInvariant())
+                .Where(x => x != null).ToList();
+            ReplayRecorder.Line("move")
+                ?.Set("src", CreatureRef(owner))
+                .Set("id", Reflect.GetString(__instance, "StateId"))
+                .Set("intents", intents.Count > 0 ? intents : null)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // "player", a bare monster id, or "effect" for a null creature. Shared by hit, power,
+    // block and move so one convention covers every actor in the journal.
+    private static string CreatureRef(object? creature)
+        => creature == null ? "effect"
+            : Reflect.GetMember(creature, "IsPlayer") is true ? "player"
+            : Ids.Bare(Reflect.GetString(creature, "ModelId")) ?? "unknown";
 
     // --- combat ----------------------------------------------------------------------
 
@@ -724,14 +783,38 @@ internal static class ReplayHooks
     }
 
     // AfterPowerAmountChanged(combatState, choiceContext, PowerModel, amount, applier, cardSource)
-    private static void PowerChanged(object __2, decimal __3)
+    private static void PowerChanged(object __2, decimal __3, object __4)
     {
         try
         {
             ReplayRecorder.Line("power")
-                ?.Set("id", Ids.Bare(Reflect.GetString(__2, "Id")))
+                // Who applied it. Without this a relic or thorns ticking on the enemy turn
+                // looked identical to a monster buffing itself, because tgt was the only clue.
+                // Same convention as hit.src: a null applier is an effect, not a failed read.
+                ?.Set("src", CreatureRef(__4))
+                .Set("id", Ids.Bare(Reflect.GetString(__2, "Id")))
                 .Set("n", (int)__3)
                 .Set("tgt", Ids.Bare(Reflect.GetString(Reflect.GetMember(__2, "Owner"), "ModelId")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CreatureCmd.Heal(creature, amount, playAnim). Patched directly because the game's
+    // AfterCurrentHpChanged did not produce an hp line for a rest-site heal, so four rest
+    // floors in a real journal recorded the option taken and never the amount. Prefix, so the
+    // amount is the one being applied rather than one re-derived after the fact.
+    private static void Healed(object __0, decimal __1)
+    {
+        try
+        {
+            if (Reflect.GetMember(__0, "IsPlayer") is not true) return;
+            var amount = (int)__1;
+            if (amount == 0) return;
+            ReplayRecorder.Line("hp")
+                ?.Set("d", amount)
+                .Set("hp", Reflect.GetInt(__0, "CurrentHp", 0) + amount)
+                .Set("src", "heal")
                 .Emit();
         }
         catch { }
@@ -742,9 +825,12 @@ internal static class ReplayHooks
     {
         try
         {
-            if (Reflect.GetMember(__1, "IsPlayer") is not true) return;
+            // Monster block is recorded too. This used to return early for anything but the
+            // player, so a monster that spent its turn gaining Block left nothing in the
+            // journal at all and the turn read as "nothing recorded".
             ReplayRecorder.Line("block")
-                ?.Set("n", (int)__2)
+                ?.Set("src", CreatureRef(__1))
+                .Set("n", (int)__2)
                 .Set("card", __4 == null ? null : Ids.Bare(Reflect.GetString(__4, "Id")))
                 .Emit();
         }

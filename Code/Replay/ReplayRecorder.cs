@@ -264,7 +264,10 @@ public static class ReplayRecorder
             //    so a consumer must branch on THIS number rather than on whether a coord
             //    happens to be present. "this mod version did not record map positions" and
             //    "this floor's position was not recorded" are different sentences.
-            ?.Set("replay_version", 2)
+            // 3  adds the move line (what an enemy actually did), src on power and block, block
+            //    for monsters as well as the player, and an hp line on heals so a rest site
+            //    records the amount rather than only the option taken.
+            ?.Set("replay_version", 3)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
             // The .run records the bare version ("v0.111.0"); Sts2Version.Current carries the
