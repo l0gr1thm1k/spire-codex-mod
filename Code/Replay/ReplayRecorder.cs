@@ -264,10 +264,12 @@ public static class ReplayRecorder
             //    so a consumer must branch on THIS number rather than on whether a coord
             //    happens to be present. "this mod version did not record map positions" and
             //    "this floor's position was not recorded" are different sentences.
+            // 4  adds starting_max_hp and starting_hp to the header, so the ascension HP
+            //    penalty is readable without inferring it from the run-start heal.
             // 3  adds the move line (what an enemy actually did), src on power and block, block
             //    for monsters as well as the player, and an hp line on heals so a rest site
             //    records the amount rather than only the option taken.
-            ?.Set("replay_version", 3)
+            ?.Set("replay_version", 4)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
             // The .run records the bare version ("v0.111.0"); Sts2Version.Current carries the
@@ -279,6 +281,20 @@ public static class ReplayRecorder
             .Set("mod_version", Api.ModVersion.Current)
             .Set("character", s.Character)
             .Set("ascension", s.Ascension)
+            // Max HP before anything in the run moves it, which is the denominator for the
+            // Ascension 2 effect. "Weary Traveler: Ancients only heal 80% of your missing HP",
+            // and a run begins at 0 HP, so the Neow heal lands at 80% of max from A2 up and
+            // 100% below it. Measured across real runs: A0 and A1 heal to full, A3, A5 and A10
+            // all heal to exactly 80%, on both Ironclad (64 of 80) and Regent (60 of 75). The
+            // penalty does not deepen past A2.
+            //
+            // end.max_hp cannot serve: by then Cook, Stone Humidifier and anything else that
+            // raises the cap have moved it. This is the value before any of that.
+            .Set("starting_max_hp", s.MaxHp > 0 ? s.MaxHp : (int?)null)
+            // No starting_hp field on purpose. The snapshot reports the character's DEFAULT at
+            // header time, before the run's real state exists, so it came back 80 on a run that
+            // actually began at 0 and was healed to 64. A confidently wrong number is worse than
+            // none. Real starting HP is the first hp line, src "heal", at floor 0.
             .Set("game_mode", s.GameMode?.ToLowerInvariant())
             .Set("modifiers", s.Modifiers)
             .Set("start_time", startTime)
