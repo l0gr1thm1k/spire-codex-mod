@@ -25,6 +25,7 @@ internal static class ReplayUploader
     // location as the .run ledger next to it.
     private static readonly object Gate = new();
     private static HashSet<string>? _sent;
+    private static HashSet<string>? _abandoned;
 
     // Sweep journals stranded on disk, at launch and whenever the toggle is switched on.
     //
@@ -160,22 +161,31 @@ internal static class ReplayUploader
             {
                 // replay_exists means the server already holds one for this run and keeps the
                 // first; either way this journal is done and must not be retried.
-                MarkSent(path);
+                MarkAccepted(path);
                 MainFile.Logger.Info($"replay upload {Path.GetFileName(path)}: ok ({result.StatusCode}) " +
                                      $"{raw.Length}B -> {gzip.Length}B");
                 return;
             }
 
-            // 404: the run doc is not visible yet. 5xx/503 storage: the server is unwell. Both
-            // are worth another attempt on a later launch, so the journal stays unmarked.
-            var retryable = result.StatusCode == 404 || result.StatusCode >= 500 || result.StatusCode == 0;
+            // Permanent ONLY when the server names a reason this exact file can never satisfy.
+            // Everything else, 400 included, gets another go on a later launch.
+            //
+            // This used to be the other way round: anything that was not a 404, a 5xx or a
+            // transport error was treated as final and written into the sent ledger. A server
+            // that had simply never heard of a newer replay_version answered 400 bad_header, and
+            // the client quietly burned seventeen journals that were perfectly good and would
+            // have been accepted the moment the allowlist was updated. A 400 means "this server,
+            // today, did not like this request", which is the most fixable failure there is, and
+            // it is exactly the one the old policy made unrecoverable.
+            //
+            // A genuinely unsendable file now costs one request per launch instead of being lost.
+            // That is the cheaper mistake by a wide margin, and the sweep is capped per launch.
+            var permanent = code is "not_owner" or "too_large";
             MainFile.Logger.Info(
                 $"replay upload {Path.GetFileName(path)}: FAILED ({result.StatusCode}) {code ?? "?"}"
-                + (retryable ? " — will retry on a later launch" : " — permanent, not retrying"));
+                + (permanent ? " — permanent, not retrying" : " — will retry on a later launch"));
 
-            // A permanent rejection (header_mismatch, too_large, not_owner) will never succeed
-            // for this file, so stop asking.
-            if (!retryable) MarkSent(path);
+            if (permanent) MarkAbandoned(path);
         }
         catch (Exception e)
         {
@@ -243,54 +253,133 @@ internal static class ReplayUploader
         return null;
     }
 
-    // --- ledger ----------------------------------------------------------------------
+    // --- ledgers -----------------------------------------------------------------------
+    //
+    // TWO files, deliberately. "Do not offer this again" and "the server has this" are different
+    // facts, and the pruner may only act on the second.
+    //
+    //   replays-sent-<steam>.txt       accepted: a 200, or replay_exists. The server HAS it.
+    //   replays-abandoned-<steam>.txt  permanently rejected (not_owner, too_large). Never sent,
+    //                                  never will be, and must never be deleted on that basis.
+    //
+    // One combined file is what made the outage worse: a 400 wrote into it, so a file that had
+    // never reached the server looked identical to one that had. A pruner keyed on that would
+    // have deleted unsent runs.
 
-    private static string? LedgerPath()
+    private static string? LedgerPath(string kind)
     {
         try
         {
             if (string.IsNullOrEmpty(Config.SteamId)) return null;
             var dir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SpireCodex");
-            return Path.Combine(dir, $"replays-sent-{Config.SteamId}.txt");
+            return Path.Combine(dir, $"replays-{kind}-{Config.SteamId}.txt");
         }
         catch { return null; }
+    }
+
+    private static HashSet<string> Load(string kind)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var lp = LedgerPath(kind);
+            if (lp != null && File.Exists(lp))
+                foreach (var line in File.ReadAllLines(lp))
+                    if (!string.IsNullOrWhiteSpace(line)) set.Add(line.Trim());
+        }
+        catch { /* a missing ledger just means we may re-offer once; the server dedupes */ }
+        return set;
     }
 
     private static bool AlreadySent(string path)
     {
         lock (Gate)
         {
-            if (_sent == null)
-            {
-                _sent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                try
-                {
-                    var lp = LedgerPath();
-                    if (lp != null && File.Exists(lp))
-                        foreach (var line in File.ReadAllLines(lp))
-                            if (!string.IsNullOrWhiteSpace(line)) _sent.Add(line.Trim());
-                }
-                catch { /* a missing ledger just means we may re-send once; the server dedupes */ }
-            }
-            return _sent.Contains(Path.GetFullPath(path));
+            _sent ??= Load("sent");
+            _abandoned ??= Load("abandoned");
+            var full = Path.GetFullPath(path);
+            return _sent.Contains(full) || _abandoned.Contains(full);
         }
     }
 
-    private static void MarkSent(string path)
+    // The server has this journal. The ONLY thing that authorises deleting it later.
+    private static void MarkAccepted(string path) => Append("sent", ref _sent, path);
+
+    // Rejected for a reason this file can never satisfy. Stops re-offering; authorises nothing.
+    private static void MarkAbandoned(string path) => Append("abandoned", ref _abandoned, path);
+
+    private static void Append(string kind, ref HashSet<string>? cache, string path)
     {
         lock (Gate)
         {
-            _sent ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (!_sent.Add(Path.GetFullPath(path))) return;
+            cache ??= Load(kind);
+            if (!cache.Add(Path.GetFullPath(path))) return;
             try
             {
-                var lp = LedgerPath();
+                var lp = LedgerPath(kind);
                 if (lp == null) return;
                 Directory.CreateDirectory(Path.GetDirectoryName(lp)!);
                 File.AppendAllText(lp, Path.GetFullPath(path) + "\n");
             }
             catch { /* best effort; the server's duplicate check is the real guard */ }
+        }
+    }
+
+    private static bool IsAccepted(string path)
+    {
+        lock (Gate)
+        {
+            _sent ??= Load("sent");
+            return _sent.Contains(Path.GetFullPath(path));
+        }
+    }
+
+    // --- retention ----------------------------------------------------------------------
+
+    private const int RetentionDays = 90;
+
+    // Delete local journals 90 days after they were last written, but ONLY where deleting one
+    // cannot lose data that never reached the server.
+    //
+    // Two ways a journal earns deletion:
+    //   - the server accepted it, so a copy exists off this machine; or
+    //   - replay uploading is off, so it was never going to leave and is purely local.
+    //
+    // Everything else is kept forever, on purpose: a journal waiting to upload, one the server
+    // permanently rejected, and the run currently being written. Age alone is never enough.
+    // Seventeen journals were silently burned by an upload policy that assumed a failure was
+    // final, and this is the same mistake with a delete on the end of it.
+    public static void PruneOld()
+    {
+        try
+        {
+            string[] files;
+            try { files = Directory.GetFiles(ReplayRecorder.Dir, "*.jsonl"); }
+            catch { return; }
+
+            // Off means these were never going to leave the machine, so age is the only question.
+            var uploading = SpireCodexConfig.UploadReplays && Config.UploadRuns && Consent.ReplaysGranted;
+            var cutoff = DateTime.UtcNow.AddDays(-RetentionDays);
+            var removed = 0;
+
+            foreach (var path in files)
+            {
+                if (ReplayRecorder.Active && path == ReplayRecorder.CurrentPath) continue;
+                DateTime written;
+                try { written = File.GetLastWriteTimeUtc(path); }
+                catch { continue; }
+                if (written > cutoff) continue;
+                if (uploading && !IsAccepted(path)) continue; // still owed to the server
+                try { File.Delete(path); removed++; }
+                catch { /* locked or gone; next launch tries again */ }
+            }
+            if (removed > 0)
+                MainFile.Logger.Info($"replay: pruned {removed} journal(s) older than {RetentionDays} days");
+        }
+        catch (Exception e)
+        {
+            MainFile.Logger.Info($"replay prune error: {e.Message}");
         }
     }
 }

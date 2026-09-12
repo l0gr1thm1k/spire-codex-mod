@@ -77,6 +77,9 @@ public static class ReplayRecorder
         {
             Directory.CreateDirectory(Dir);
             RecoverAbandoned();
+            // After recovery, never before: a journal gets its terminal line first, so an
+            // interrupted one is a complete record by the time retention looks at it.
+            ReplayUploader.PruneOld();
         }
         catch (Exception e)
         {
