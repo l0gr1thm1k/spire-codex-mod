@@ -30,6 +30,11 @@ internal static class ReplayHooks
     private static int _decision;
     private static string? _decisionType;
 
+    // What OpenSelectOffer composes for the enchantment screen, "deck_select" + "enchant".
+    // Named because CardEnchanted has to tell an enchant offer from any other open select
+    // before it joins to one.
+    private const string EnchantSelectType = "deck_select_enchant";
+
     // Signature of the event page a decision was opened for. Multi-page events (Neow offers a
     // boon and then a separate Proceed) are two distinct choice sets, and keying only on
     // "am I already in an event" would collapse them into one decision with two winners.
@@ -200,7 +205,13 @@ internal static class ReplayHooks
         if (_selectByInstance == null || card == null) return null;
         var instance = CardInstances.Of(card);
         if (instance == 0 || !_selectByInstance.TryGetValue(instance, out var idx)) return null;
-        (_selected ??= new List<int>()).Add(idx);
+        // Registered once even when two handlers see the same pick: the `pick` row names every
+        // card LogChoice returned, and the per-consequence handlers (remove, upgrade,
+        // transform) then name the same card again. One option row is one physical card, so it
+        // cannot honestly be selected twice, and appending twice would have made the outcome
+        // line's n_selected count handlers instead of choices.
+        var picks = _selected ??= new List<int>();
+        if (!picks.Contains(idx)) picks.Add(idx);
         return idx;
     }
 
@@ -273,6 +284,26 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"),
                                  "FromDeckGeneric", me, nameof(DeckSelectOffered), 4);
 
+        // The result half, from the one private funnel all eleven entry points call. Registered
+        // beside the offer above because the two are read together: the offer names the
+        // alternatives, this names the choice. It fires for screens whose offer is not patched
+        // yet, and a `pick` row with no decision_id is still the pick.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"),
+                                 "LogChoice", me, nameof(SelectionReturned), 2);
+
+        // The enchantment screen. FromDeckForEnchantment does NOT delegate to FromDeckGeneric:
+        // it filters the deck on enchantment.CanEnchant itself and shows
+        // NDeckEnchantSelectScreen, a SIBLING of NDeckCardSelectScreen under
+        // NCardGridSelectionScreen rather than a subclass, so nothing above catches it. This is
+        // the terminal overload of three; the other two delegate to it, and it takes the
+        // presented list directly so the offer needs no reconstruction from the deck.
+        //
+        // firstParamType disambiguates it from the (Player, EnchantmentModel, int,
+        // CardSelectorPrefs) overload, which has the same arity.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"),
+                                 "FromDeckForEnchantment", me, nameof(EnchantSelectOffered), 4,
+                                 firstParamType: "IReadOnlyList`1");
+
         // Resolutions. Each carries decision_id so `applied` is derived from the effect
         // actually landing rather than from an async return value.
         attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeCardRemoved", me, nameof(CardRemoved));
@@ -299,6 +330,20 @@ internal static class ReplayHooks
                                  "Upgrade", me, nameof(CardUpgraded), 2, firstParamType: "CardModel");
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
                                  "Transform", me, nameof(CardTransformed), 3, firstParamType: "CardModel");
+        // Enchantment has no hook at all: Hook.cs names Enchantment only to read damage and
+        // block modifiers. CardCmd.Enchant is the patch point instead, and it is the right one
+        // on three counts. It is SYNCHRONOUS, returning EnchantmentModel? rather than a Task,
+        // so a postfix reads the applied result directly instead of hitting the async trap
+        // documented on FromDeckGeneric above. It is UNIVERSAL: the line inside it that appends
+        // to PlayerMapPointHistoryEntry.CardsEnchanted is the game's sole writer of that list,
+        // and a run whose only enchantment came from an event still has the card in its
+        // map-point history, so the event paths provably land here -- one patch covers all the
+        // relics, every event, and any future source. And it sees what no screen shows: a relic
+        // that sweeps the whole deck opens no selector, and neither does the enchant screen when
+        // the eligible set is no larger than MinSelect.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "Enchant", me, nameof(CardEnchanted), 3,
+                                 firstParamType: "EnchantmentModel", postfix: true);
 
         // Relics, potions, events, rest.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
@@ -965,13 +1010,10 @@ internal static class ReplayHooks
         catch { }
     }
 
-    // CardSelectCmd.FromDeckGeneric(player, prefs, filter, sort) — the funnel behind every
-    // "choose a card from your deck" screen: removal, upgrade, transform, and event picks.
-    // Its postfix is where the genuinely eligible set is known, filter applied.
-    // Map CardSelectorPrefs.Prompt's loc key to the actual intent. FromDeckGeneric is the
-    // funnel for removal, upgrade, transform, exhaust, enchant and discard selections; the
-    // earlier version labelled every option "remove", which would have fed campfire upgrades
-    // and event transforms straight into Removal Elo as if they were removal alternatives.
+    // Map CardSelectorPrefs.Prompt's loc key to the actual intent. Every selection screen
+    // carries prefs, so this reads the same for all of them; the earlier version labelled
+    // every option "remove", which would have fed campfire upgrades and event transforms
+    // straight into Removal Elo as if they were removal alternatives.
     private static string SelectKind(object? prefs)
     {
         // LocString exposes LocEntryKey (and LocTable); there is no "Key". Reading the wrong
@@ -987,61 +1029,172 @@ internal static class ReplayHooks
         return "unknown"; // never silently "remove": a miss must not look like a removal offer
     }
 
+    // CardSelectCmd.FromDeckGeneric(player, prefs, filter, sort) — the deck funnel behind
+    // removal and the event picks that route through it. Its prefix is where the genuinely
+    // eligible set is known, filter applied.
     private static void DeckSelectOffered(object __0, object __1, object __2)
     {
         try
         {
-            if (ReplayRecorder.Line("decision") is not { } line) return;
-            FlushSelectOutcome(); // a previous select closes here, still under ITS decision id
-            _decision = ReplayRecorder.NextDecisionId();
-            var kind = SelectKind(__1);
-            _decisionType = "deck_select_" + kind;
-
             var deck = Reflect.GetMember(Reflect.GetMember(__0, "Deck"), "Cards");
-            var selectableCount = 0;
-            // Empty, not null: from here on a select IS open, so its outcome line is owed even
-            // if the player picks nothing.
-            _selectByInstance = new Dictionary<int, int>();
-            _selected = new List<int>();
+            OpenSelectOffer("deck_select", SelectKind(__1), __0, __1, Enumerate(deck), __2)?.Emit();
+        }
+        catch { }
+    }
 
-            var options = new List<ReplayLine>();
-            var i = 0;
-            foreach (var card in Enumerate(deck))
+    // CardSelectCmd.FromDeckForEnchantment(cards, enchantment, amount, prefs) — the terminal
+    // overload, so this fires once whichever of the three a relic or event called.
+    //
+    // The presented set arrives already filtered by CanEnchant (and by the caller's own
+    // additionalFilter, on the overload that takes one), so it IS the eligible set and there is
+    // no filter left to apply: every option row is selectable by construction.
+    //
+    // SelectKind needs no new case. CardSelectorPrefs.EnchantSelectionPrompt is
+    // LocString("card_selection", "TO_ENCHANT") and SelectKind already matches on
+    // Contains("ENCHANT") — that branch has simply been unreachable, because the only patched
+    // entry point never carried an enchant prompt. decision_type has been deck_select_remove
+    // and nothing else for the life of the replay.
+    private static void EnchantSelectOffered(object __0, object __1, int __2, object __3)
+    {
+        try
+        {
+            var cards = new List<object>(Enumerate(__0));
+            // The game shows no screen for an empty set and does not log a choice for one
+            // either (its LogChoice call is guarded on cards.Count > 0). Minting a decision
+            // nothing can resolve would flush an outcome of "decline" at the next offer, so an
+            // offer of nothing records nothing. The enchant row still fires if the deck changes.
+            if (cards.Count == 0) return;
+
+            // Recorded even when the eligible set is no larger than MinSelect and the game
+            // auto-selects without a screen: n_presented against min_select is how a consumer
+            // sees the player was never asked, and the pick still needs an offer to join to.
+            OpenSelectOffer("deck_select", SelectKind(__3), Reflect.GetMember(cards[0], "Owner"),
+                            __3, cards, filter: null)
+                ?.Set("enchantment", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Set("amount", __2)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // The shared body behind a card-selection offer: one nested option row per presented card,
+    // carrying the instance id that joins it to the rest of the run and whether this screen
+    // would let it be chosen.
+    //
+    // Split out of DeckSelectOffered because FromDeckGeneric is one of ELEVEN public entry
+    // points on CardSelectCmd, and the enchantment screen below is a second. The nine still
+    // unpatched — hand, combat pile, upgrade, transform, the two grids, bundles — present their
+    // own sets and do not delegate here, so each needs its own prefix. They differ only in where
+    // the presented set and the player come from, so whatever is the same now lives here.
+    //
+    // Returns the decision line UNEMITTED so a caller can add the fields only it knows before
+    // emitting. Null means no run is being recorded, and on that path no decision id is minted
+    // and no outcome flushed: keeping the journal check first stops an unrecorded session from
+    // advancing decision state nothing will ever read.
+    private static ReplayLine? OpenSelectOffer(string source, string kind, object? player,
+                                               object? prefs, IEnumerable<object> cards,
+                                               object? filter)
+    {
+        if (ReplayRecorder.Line("decision") is not { } line) return null;
+        FlushSelectOutcome(); // a previous select closes here, still under ITS decision id
+        _decision = ReplayRecorder.NextDecisionId();
+        _decisionType = source + "_" + kind;
+
+        var selectableCount = 0;
+        // Empty, not null: from here on a select IS open, so its outcome line is owed even
+        // if the player picks nothing.
+        _selectByInstance = new Dictionary<int, int>();
+        _selected = new List<int>();
+
+        var options = new List<ReplayLine>();
+        var i = 0;
+        foreach (var card in cards)
+        {
+            var id = CardInstances.Of(card);
+            // filter is the caller's Func<CardModel, bool>, already composed with the screen's
+            // own eligibility rule by the entry point (IsRemovable for removal, CanEnchant for
+            // enchantment). Card-selection predicates are pure, so invoking one here observes
+            // eligibility without changing anything. A null filter means the presented set is
+            // already the eligible set.
+            var selectable = filter == null
+                || Reflect.CallWith(filter, "Invoke", card) is true;
+            if (selectable) selectableCount++;
+            if (id != 0) _selectByInstance[id] = i;
+            var row = new ReplayLine("o")
+                .Set("option_index", i++)
+                .Set("option_kind", kind)
+                .Set("option_id", Ids.Bare(Reflect.GetString(card, "Id")))
+                .Set("instance_id", id)
+                .Set("up", Reflect.GetInt(card, "CurrentUpgradeLevel", 0))
+                .SetFlag("presented", true)
+                .SetFlag("selectable", selectable);
+            if (!selectable)
+                row.Set("selectable_reason",
+                    Reflect.GetBool(card, "IsRemovable", true) ? "filtered" : "eternal");
+            options.Add(row);
+        }
+
+        return line.Set("decision_id", _decision)
+            .Set("decision_type", _decisionType)
+            .Set("source", source)
+            .Set("select_kind", kind)
+            .Set("min_select", Reflect.GetInt(prefs, "MinSelect", 1))
+            .Set("max_select", Reflect.GetInt(prefs, "MaxSelect", 1))
+            .SetFlag("decline_available", Reflect.GetBool(prefs, "Cancelable"))
+            .Set("n_presented", options.Count)
+            .Set("n_selectable", selectableCount)
+            .Set("gold_on_hand", Reflect.GetInt(player, "Gold", 0))
+            .Set("options", options);
+    }
+
+    // CardSelectCmd.LogChoice(Player, IEnumerable<CardModel?>) — the private funnel ALL eleven
+    // entry points converge on, where the game takes the cards the screen returned, formats
+    // them as English and puts them in a text log. It is the one place "what did the player
+    // actually pick" exists for every selection screen at once.
+    //
+    // Until now a pick was only ever read back from its consequence: removal from
+    // BeforeCardRemoved, upgrade and transform from their own hooks. Screens whose consequence
+    // has no hook resolved to nothing, and an offer that resolved to nothing flushed an outcome
+    // of "decline" — not an absence of data but a wrong answer.
+    //
+    // PREFIX, not postfix. LogChoice enumerates the sequence itself, so reading it first is
+    // guaranteed to see the full set. Re-enumerating is safe by construction because the game
+    // already does it twice: every entry point ends `LogChoice(player, enumerable); return
+    // enumerable;` and its own caller then enumerates what came back.
+    private static void SelectionReturned(object __1)
+    {
+        try
+        {
+            var picked = new List<ReplayLine>();
+            // Whether a returned card was actually in the offer we recorded. CardInstances.Of
+            // mints on first sight, so a null index means "not in this offer" rather than "not
+            // seen before", which makes it a proof of provenance: one card found in
+            // _selectByInstance is one card this screen took from a set we wrote down.
+            var joined = false;
+            foreach (var card in Enumerate(__1))
             {
-                var id = CardInstances.Of(card);
-                // __2 is the caller's Func<CardModel, bool> filter, already composed with
-                // IsRemovable by CardSelectCmd.FromDeck. Card-selection predicates are pure,
-                // so invoking one here observes eligibility without changing anything. A null
-                // filter means the caller accepts the whole deck.
-                var selectable = __2 == null
-                    || Reflect.CallWith(__2, "Invoke", card) is true;
-                if (selectable) selectableCount++;
-                if (id != 0) _selectByInstance[id] = i;
-                var row = new ReplayLine("o")
-                    .Set("option_index", i++)
-                    .Set("option_kind", kind)
-                    .Set("option_id", Ids.Bare(Reflect.GetString(card, "Id")))
-                    .Set("instance_id", id)
-                    .Set("up", Reflect.GetInt(card, "CurrentUpgradeLevel", 0))
-                    .SetFlag("presented", true)
-                    .SetFlag("selectable", selectable);
-                if (!selectable)
-                    row.Set("selectable_reason",
-                        Reflect.GetBool(card, "IsRemovable", true) ? "filtered" : "eternal");
-                options.Add(row);
+                // Registers the pick against the open offer, which is what makes the outcome
+                // line's selected_option_indices a record rather than a guess.
+                var optionIndex = SelectIndexOf(card);
+                if (optionIndex != null) joined = true;
+                picked.Add(new ReplayLine("p")
+                    .Set("option_index", optionIndex)
+                    .Set("c", CardInstances.Of(card))
+                    .Set("id", Ids.Bare(Reflect.GetString(card, "Id")))
+                    .Set("up", Reflect.GetInt(card, "CurrentUpgradeLevel", 0)));
             }
 
-            line.Set("decision_id", _decision)
-                .Set("decision_type", _decisionType)
-                .Set("source", "deck_select")
-                .Set("select_kind", kind)
-                .Set("min_select", Reflect.GetInt(__1, "MinSelect", 1))
-                .Set("max_select", Reflect.GetInt(__1, "MaxSelect", 1))
-                .SetFlag("decline_available", Reflect.GetBool(__1, "Cancelable"))
-                .Set("n_presented", options.Count)
-                .Set("n_selectable", selectableCount)
-                .Set("gold_on_hand", Reflect.GetInt(__0, "Gold", 0))
-                .Set("options", options)
+            ReplayRecorder.Line("pick")
+                // decision_id ONLY on a proven join. This patch turns the result on for all
+                // eleven screens at once while only one of them records its offer, so ten of
+                // them would otherwise inherit whatever decision was last open — a card reward
+                // three rooms back claiming to be the Retain pick. An unjoined pick names its
+                // cards and stays silent about the offer; `outcome` remains the authority on
+                // whether a recorded offer was declined.
+                ?.Set("decision_id", joined ? _decision : (int?)null)
+                .Set("decision_type", joined ? _decisionType : null)
+                .Set("n_picked", picked.Count)
+                .Set("cards", picked)
                 .Emit();
         }
         catch { }
@@ -1220,6 +1373,64 @@ internal static class ReplayHooks
                 .Emit();
         }
         catch { }
+    }
+
+    // CardCmd.Enchant(enchantment, card, amount) -> EnchantmentModel?. The only witness
+    // enchantment has: the deck mutation with no hook, no resolution row and, until the offer
+    // patch above, no decision row either.
+    //
+    // Enchant ADDS to an existing enchantment of the same type and throws on a different one,
+    // so a card carries at most one and a second row for the same card is a stack, not a
+    // replacement. `amount` is what this call applied; `amount_total` is the enchantment's
+    // amount afterwards, read off the returned model, so a consumer grading against the game's
+    // own save (players[].deck[].enchantment.amount) compares a value rather than folding rows.
+    private static void CardEnchanted(object __0, object __1, decimal __2, object? __result)
+    {
+        try
+        {
+            // The game reports the enchantment that landed. A null return means none did, and
+            // claiming an enchantment the deck did not take is the one failure mode here that
+            // would look like data.
+            if (__result == null) return;
+
+            // Join ONLY to an enchantment offer. A relic that sweeps the deck can fire while an
+            // unrelated removal select is still open, and the deck cards it touches are in that
+            // offer's instance map too — so an ungated lookup would hand the sweep a removal's
+            // option_index and register a pick against a decision the player never made.
+            // Omitting both fields is also how a consumer tells a choice from a sweep.
+            var offered = _decisionType == EnchantSelectType;
+            var optionIndex = offered ? SelectIndexOf(__1) : null;
+
+            ReplayRecorder.Line("enchant")
+                ?.Set("decision_id", optionIndex != null ? _decision : (int?)null)
+                .Set("option_index", optionIndex)
+                .Set("c", CardInstances.Of(__1))
+                .Set("id", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Set("enchantment", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Set("amount", __2)
+                .Set("amount_total", Reflect.GetInt(__result, "Amount", 0))
+                // Where the card was when the enchantment landed — the same gate the game
+                // itself uses, since Enchant adds to CardsEnchanted only when the pile is the
+                // Deck. Silken Tress is what makes this load-bearing: it clones each card
+                // reward option and enchants the clone BEFORE it belongs to any pile, so three
+                // cards are enchanted and at most one reaches the deck. Measured on a real run,
+                // the game's own cards_enchanted was EMPTY and all three landed under
+                // card_choices instead. So `pile: "deck"` is a deck mutation on its own, and
+                // anything else means "counts only if an acquire row for the same c follows".
+                .Set("pile", PileName(__1))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // The lowercased PileType of a card's current pile, or "none" when it is in no pile at
+    // all, which is a freshly cloned reward option. CardChangedPiles already compares this
+    // enum by ToString(), so this reads it the same way.
+    private static string PileName(object? card)
+    {
+        var pile = Reflect.GetMember(card, "Pile");
+        var type = pile == null ? "None" : Reflect.GetString(pile, "Type");
+        return (type ?? "unknown").ToLowerInvariant();
     }
 
     // Transform genuinely swaps objects, so this is the one place the lineage thread would
