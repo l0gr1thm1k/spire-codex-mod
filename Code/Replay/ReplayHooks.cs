@@ -459,6 +459,12 @@ internal static class ReplayHooks
             // the next room's resolutions would silently mis-attribute picks.
             DemoteDecision();
             _eventPage = null;
+            // An abandoned purchase never reaches AfterItemPurchased, so it would leave the
+            // pending ware set for the rest of the run. RelicObtained reads that to tell a
+            // relic off a shelf from one out of a decision, and a stale value would make it
+            // drop a decision_id it should have kept.
+            _pendingBuyId = null;
+            _pendingBuyKind = null;
 
             var kind = __1.GetType().Name.Replace("Room", "").ToLowerInvariant();
             // Floor from the live run state, not the centrally-stamped snapshot value: the
@@ -1227,7 +1233,16 @@ internal static class ReplayHooks
             _pendingBuyKind = null;
 
             ReplayRecorder.Line("buy")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
+                // Only the removal service IS the open decision's paid half. Shop stock is not
+                // a decision in this schema -- the shop line lists it and `slot` below names
+                // which entry was taken -- so a card, relic or potion purchase has no decision
+                // to belong to. Attaching whatever happened to be open was worse than attaching
+                // nothing: a removal screen stays open for the rest of the visit, so every later
+                // purchase claimed it, and a relic that opens a selection screen gets billed to
+                // the screen it caused, because its own purchase lands after that screen
+                // resolves.
+                ?.Set("decision_id",
+                    kind == "removal_service" && _decision > 0 ? _decision : (int?)null)
                 .Set("kind", kind)
                 // Which stock entry this was, indexed the same way the shop line lists them, so
                 // a purchase still matches when the same card is on the shelf twice.
@@ -1341,8 +1356,12 @@ internal static class ReplayHooks
                 // "granted" means no choice was made, so it never carries a decision — a card
                 // stolen and returned mid-combat was inheriting whatever reward happened to be
                 // open and would have read as a pick.
+                // "shop" joins the same way "granted" does -- not at all. Shop stock is not a
+                // decision in this schema; the buy line's `slot` names which entry was taken.
+                // It was inheriting the open decision, and a card-removal select stays open for
+                // the rest of the visit, so a purchased card read as one of its picks.
                 ?.Set("decision_id", offered ? decisionForCard
-                        : source == "granted" ? (int?)null
+                        : source == "granted" || source == "shop" ? (int?)null
                         : _decision > 0 ? _decision : (int?)null)
                 .Set("source", source)
                 .Set("c", CardInstances.Of(__2))
@@ -1463,8 +1482,14 @@ internal static class ReplayHooks
     {
         try
         {
+            // A relic arriving mid-purchase came off a shelf, not out of the open decision.
+            // _pendingBuyKind is set by PurchaseAttempt and cleared by ItemPurchased, so it is
+            // non-null exactly for the window this hook fires in during a buy. Without the
+            // gate a shop relic claimed whatever screen was open -- a card-removal select
+            // stays open for the whole visit, so the relic rendered as one of its options.
+            var fromShelf = _pendingBuyKind != null;
             ReplayRecorder.Line("relic")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
+                ?.Set("decision_id", !fromShelf && _decision > 0 ? _decision : (int?)null)
                 .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
                 .Emit();
         }
