@@ -290,6 +290,14 @@ public static class ReplayRecorder
             //    deck_select_enchant as a decision_type. Enchantment had no witness of any
             //    kind before this, so a 4 reader cannot tell an enchanted deck from a plain
             //    one; everything here is additive and a 4 reader is otherwise unaffected.
+            //
+            // Still 5 with up/enchantment/amount on deck rows, deliberately. The backend
+            // rejects a replay_version it has not shipped (400 bad_header against
+            // KNOWN_REPLAY_VERSIONS), so bumping ahead of a deploy makes every upload fail,
+            // and these fields need no version to be read: `up` is emitted even at 0, so deck
+            // rows either all carry it or none do, and its absence dates the capture exactly
+            // the way a bump would. Fold the bump into the next change that genuinely needs
+            // one.
             ?.Set("replay_version", 5)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
@@ -452,9 +460,29 @@ public static class ReplayRecorder
             foreach (var card in cards)
             {
                 if (card == null) continue;
+                // Upgrade level and enchantment are STATED here, not left to be re-threaded
+                // from earlier rows.
+                //
+                // This is what a reload actually costs. The upgrade and enchant rows from the
+                // previous session are still in the file, so the facts are not lost -- but they
+                // name cards by an instance id whose objects the save reload destroyed, and 43%
+                // of deck cards share their card id with another copy, so re-attaching them is
+                // a guess. On a run with an Adroit Zap and four plain Defends, "which Defend"
+                // is unrecoverable and "was the Zap enchanted" should never have depended on
+                // recovering it. Reading the live card answers the second question outright.
+                //
+                // `up` is emitted even at 0 so that its ABSENCE means "this capture predates
+                // the field" rather than "this card is not upgraded" -- the same reason
+                // replay_version 2 had to be distinguishable from a null coord.
+                var enchantment = Reflect.GetMember(card, "Enchantment");
                 rows.Add(new ReplayLine("c")
                     .Set("c", CardInstances.Of(card))
-                    .Set("id", Core.Ids.Bare(Reflect.GetString(card, "Id"))));
+                    .Set("id", Core.Ids.Bare(Reflect.GetString(card, "Id")))
+                    .Set("up", Reflect.GetInt(card, "CurrentUpgradeLevel", 0))
+                    .Set("enchantment", enchantment == null
+                        ? null : Core.Ids.Bare(Reflect.GetString(enchantment, "Id")))
+                    .Set("amount", enchantment == null
+                        ? (int?)null : Reflect.GetInt(enchantment, "Amount", 0)));
             }
         }
         catch { }
