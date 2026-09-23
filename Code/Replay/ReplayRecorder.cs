@@ -167,6 +167,18 @@ public static class ReplayRecorder
             var journal = ReplayJournal.Open(Dir, runSeed, startTime);
             if (journal == null) return;
 
+            // Pick the id counters back up where the previous session of this run left them.
+            // The resets above are correct for a genuinely new run and wrong for a reload: the
+            // journal filename is derived from seed + start_time, so a reload APPENDS to a file
+            // that already contains card ids 1..N and decision ids 1..M, and restarting at 0
+            // reissues every one of them to different things. Both marks come from the single
+            // scan ReplayJournal already ran to resume `s`, so this costs no extra file read.
+            //
+            // Must happen before WriteHeader: its starting_deck mints an id for every card in
+            // the deck, and on a resume that is the whole current deck.
+            CardInstances.ResumeFrom(journal.LastCardId);
+            Interlocked.Exchange(ref _decisionId, journal.LastDecisionId);
+
             lock (Gate) _journal = journal;
             WriteHeader(snapshot, runSeed, startTime);
 

@@ -69,6 +69,12 @@ internal sealed class ReplayJournal : IDisposable
 
     public bool Resumed { get; }
 
+    // Highest card-instance id and decision id already written to this file, or 0 when it is
+    // new. The recorder resumes its counters above these so a reloaded session never re-mints
+    // an id the earlier session already used. See ReplayJournalScan.HighWaterOf.
+    public int LastCardId { get; }
+    public int LastDecisionId { get; }
+
     private ReplayJournal(string path)
     {
         Path = path;
@@ -76,13 +82,15 @@ internal sealed class ReplayJournal : IDisposable
         // to continue rather than restart. Without this a reloaded run wrote a second s=0,1,2…
         // into a file that already had them, and the exploder keys events on (run_hash, s):
         // duplicate keys, silently, on exactly the runs the save-scum work is trying to study.
-        var last = LastSequence(path);
+        var prior = ReplayJournalScan.HighWaterOf(path);
         // True when this journal reopened a file that already had lines, which is the ONLY
         // reliable signal that a run is being picked back up. The game's reload counter does not
         // move on a save-and-quit-to-menu followed by Continue in the same process, so gating the
         // resume marker on it left that boundary unmarked.
-        Resumed = last >= 0;
-        _seq = last + 1;
+        Resumed = prior.Seq >= 0;
+        _seq = prior.Seq + 1;
+        LastCardId = prior.Card;
+        LastDecisionId = prior.Decision;
         _channel = Channel.CreateBounded<ReplayLine>(new BoundedChannelOptions(QueueCapacity)
         {
             // Wait, NOT DropWrite. This is the mode that makes overflow OBSERVABLE.
@@ -104,43 +112,11 @@ internal sealed class ReplayJournal : IDisposable
             WriteLoopAsync, TaskCreationOptions.LongRunning).Unwrap();
     }
 
-    // Highest `s` already in the file, or -1 when it is new or unreadable. Reads the tail only;
-    // journals reach hundreds of KB and this runs on the run-start path.
-    // Also used by the crash-recovery scan, which appends its marker from outside the writer
-    // and so has no sequence state of its own.
-    internal static long LastSequence(string path)
-    {
-        try
-        {
-            if (!File.Exists(path)) return -1;
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            var take = (int)Math.Min(fs.Length, 8192);
-            if (take == 0) return -1;
-            fs.Seek(-take, SeekOrigin.End);
-            var buf = new byte[take];
-            var read = fs.Read(buf, 0, take);
-            var tail = System.Text.Encoding.UTF8.GetString(buf, 0, read);
-
-            var best = -1L;
-            foreach (var line in tail.Split('\n'))
-            {
-                var at = line.IndexOf("\"s\":", StringComparison.Ordinal);
-                if (at < 0) continue;
-                var start = at + 4;
-                // Tolerate whitespace after the colon. The writer never emits it, so this costs
-                // nothing in practice, but without it any journal not produced by this writer
-                // silently reads as "no sequence" and the caller restarts from 0. That is how a
-                // hand-written test fixture fooled me into thinking the recovery fix had failed.
-                while (start < line.Length && char.IsWhiteSpace(line[start])) start++;
-                var end = start;
-                while (end < line.Length && char.IsDigit(line[end])) end++;
-                if (end > start && long.TryParse(line.Substring(start, end - start), out var v) && v > best)
-                    best = v;
-            }
-            return best;
-        }
-        catch { return -1; }
-    }
+    // Resuming the counters is pure file/string work with no game coupling, so it lives in
+    // ReplayJournalScan where the test project can compile it directly -- the mod assembly
+    // needs Godot to load, and a guard that only works with the game running is no guard at
+    // all (the same reason JsonContractTests reads source rather than reflecting over types).
+    internal static long LastSequence(string path) => ReplayJournalScan.LastSequence(path);
 
     // Open a journal for a run. Returns null when the path can't be prepared, and the
     // recorder then simply doesn't record; a replay is never worth failing a run over.
