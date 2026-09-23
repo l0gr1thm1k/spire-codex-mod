@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Text.Json;
 
 namespace SpireCodex.Replay;
 
@@ -58,17 +60,23 @@ public static class ReplayJournalScan
     // journal open, on the run-start path, against a file that reaches ~1.5 MB at the extreme.
     public readonly struct HighWater
     {
-        public HighWater(long seq, int card, int decision)
+        public HighWater(long seq, int card, int decision, string? deckLine)
         {
             Seq = seq;
             Card = card;
             Decision = decision;
+            DeckLine = deckLine;
         }
 
         // -1 when the file is new or unreadable, matching LastSequence.
         public long Seq { get; }
         public int Card { get; }
         public int Decision { get; }
+
+        // The raw text of the last line in the file that listed the whole deck, or null when
+        // there is none. Kept as text and parsed only if it is needed, so the common case (a
+        // new run) parses nothing at all.
+        public string? DeckLine { get; }
     }
 
     public static HighWater HighWaterOf(string path)
@@ -76,9 +84,10 @@ public static class ReplayJournalScan
         var seq = -1L;
         var card = 0L;
         var decision = 0L;
+        string? deckLine = null;
         try
         {
-            if (!File.Exists(path)) return new HighWater(-1, 0, 0);
+            if (!File.Exists(path)) return new HighWater(-1, 0, 0, null);
             using var stream = new FileStream(
                 path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = new StreamReader(stream);
@@ -94,6 +103,12 @@ public static class ReplayJournalScan
                 card = MaxField(line, "to_c", card);
                 card = MaxField(line, "instance_id", card);
                 decision = MaxField(line, "decision_id", decision);
+                // The newest full deck listing wins, whichever kind wrote it: a `deck` row from
+                // mid-session, or the `starting_deck` on a header. Cheap substring tests, so the
+                // scan stays one pass and allocates nothing per line.
+                if (line.Contains("\"t\":\"deck\"", StringComparison.Ordinal)
+                    || line.Contains("\"starting_deck\":", StringComparison.Ordinal))
+                    deckLine = line;
             }
         }
         catch
@@ -101,7 +116,7 @@ public static class ReplayJournalScan
             // A truncated or unreadable tail still leaves everything read so far usable, and a
             // high-water mark that is too LOW is the pre-existing behaviour, not a regression.
         }
-        return new HighWater(seq, (int)card, (int)decision);
+        return new HighWater(seq, (int)card, (int)decision, deckLine);
     }
 
     // Highest value of "<key>":<integer> anywhere in the line, or `best` when the key is absent.
@@ -127,4 +142,58 @@ public static class ReplayJournalScan
         }
         return best;
     }
+
+    // The deck a stored listing describes, as remap entries. Returns an empty list for
+    // anything it cannot read: a malformed line, or a listing written before deck rows carried
+    // `up`, in which case the key would be built from different fields on the two sides and
+    // would mis-align rather than fail. A listing we cannot key is not a listing we can trust.
+    public static List<DeckRemap.Entry> DeckEntries(string? line)
+    {
+        var rows = new List<DeckRemap.Entry>();
+        if (string.IsNullOrEmpty(line)) return rows;
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            // `cards` is NOT unique to a deck listing -- the `shop` row carries the shelf under
+            // the same key. Gate on the row type so a shop's stock can never be read as a deck;
+            // the missing-`up` refusal below would catch it today, but only by luck.
+            var kind = Text(doc.RootElement, "t");
+            if (kind != "deck" && kind != "header") return rows;
+            if (!doc.RootElement.TryGetProperty("cards", out var cards)
+                && !doc.RootElement.TryGetProperty("starting_deck", out cards))
+                return rows;
+            if (cards.ValueKind != JsonValueKind.Array) return rows;
+            foreach (var card in cards.EnumerateArray())
+            {
+                if (card.ValueKind != JsonValueKind.Object) return Empty(rows);
+                if (!card.TryGetProperty("c", out var c) || c.ValueKind != JsonValueKind.Number)
+                    return Empty(rows);
+                // `up` absent means the capture predates it. Without it the key is not
+                // comparable against a live deck that has it, so refuse the whole listing.
+                if (!card.TryGetProperty("up", out var up) || up.ValueKind != JsonValueKind.Number)
+                    return Empty(rows);
+                rows.Add(new DeckRemap.Entry(c.GetInt32(), Key(
+                    Text(card, "id"), up.GetInt32(), Text(card, "enchantment"),
+                    card.TryGetProperty("amount", out var amt)
+                        && amt.ValueKind == JsonValueKind.Number ? amt.GetInt32() : 0)));
+            }
+        }
+        catch { return Empty(rows); }
+        return rows;
+    }
+
+    // One place that builds the key, called for the stored side here and for the live side by
+    // the recorder, because two spellings of the same key align nothing.
+    public static string Key(string? id, int up, string? enchantment, int amount)
+        => $"{id}|{up}|{enchantment}|{amount}";
+
+    private static List<DeckRemap.Entry> Empty(List<DeckRemap.Entry> rows)
+    {
+        rows.Clear();
+        return rows;
+    }
+
+    private static string? Text(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+            ? v.GetString() : null;
 }

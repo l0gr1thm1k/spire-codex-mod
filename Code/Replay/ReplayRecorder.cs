@@ -130,6 +130,7 @@ public static class ReplayRecorder
             _lastInRun = null;
             _deckSnapshot = null;
             _deckCount = -1;
+            _deckSig = 0;
             if (string.IsNullOrEmpty(seed)) return;
             _lastInRun = snapshot;
 
@@ -140,6 +141,7 @@ public static class ReplayRecorder
             Interlocked.Exchange(ref _decisionId, 0);
             _deckSnapshot = null;
             _deckCount = -1;
+            _deckSig = 0;
 
             // Identity must match the .run EXACTLY. The upload endpoint 409s on a header whose
             // seed / start_time / character disagree with the run doc, and both were wrong:
@@ -214,6 +216,8 @@ public static class ReplayRecorder
                     .Set("gold", snapshot.Gold)
                     .Set("deck_size", snapshot.DeckSize)
                     .Emit();
+            // Bridge instance ids across the reload before anything else references them.
+            if (journal.Resumed) EmitDeckRemap(journal);
             RefreshDeckIfChanged(snapshot); // so an early finish still has instance-level deck
             MainFile.Logger.Info($"replay: recording {Path.GetFileName(journal.Path)}");
         }
@@ -426,17 +430,80 @@ public static class ReplayRecorder
         return 0;
     }
 
-    // Re-capture the deck when its membership changes. The signature folds every card id in
-    // order, so a transform (same count, different card) is caught as well as an add or remove.
+    // State which pre-reload instance id each resumed card continues, where that is knowable.
+    //
+    // Emitted rather than left to consumers because the mod is the only party that ever holds
+    // both numberings, and because a consumer guessing at it by name is exactly the wrong
+    // outcome: four Defends make the guess a coin flip, and a wrong lineage is worse than a
+    // missing one. `ambiguous` is the count it refused to assert, so silence here is
+    // distinguishable from "nothing moved".
+    private static void EmitDeckRemap(ReplayJournal journal)
+    {
+        try
+        {
+            var before = ReplayJournalScan.DeckEntries(journal.DeckLine);
+            if (before.Count == 0) return;
+            // Re-reading the deck is safe and cheap: WriteHeader already minted these ids and
+            // CardInstances.Of is idempotent, so this returns the same numbering it wrote.
+            LiveDeck(out var after);
+            if (after.Count == 0) return;
+
+            var result = DeckRemap.Align(before, after);
+            if (result.Pairs.Count == 0 && result.Ambiguous == 0) return;
+
+            var rows = new List<ReplayLine>();
+            foreach (var pair in result.Pairs)
+                rows.Add(new ReplayLine("m").Set("from", pair.From).Set("to", pair.To));
+
+            Line("remap")
+                ?.Set("cards", rows.Count > 0 ? rows : null)
+                .Set("ambiguous", result.Ambiguous > 0 ? result.Ambiguous : (int?)null)
+                // Always present, true or false: "the two listings matched position for
+                // position" and "we could not tell" are different claims, and an absent flag
+                // would read as the weaker one.
+                .SetFlag("exact", result.Exact)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Re-capture the deck when it changes, and write the new listing out.
+    //
+    // The signature folds every card id IN ORDER, so a transform (same count, different card)
+    // is caught as well as an add or remove. It also folds upgrade level and enchantment,
+    // which it did not before: those do not change a card's id, so upgrading a card left the
+    // signature identical, the snapshot unrefreshed, and `final_deck` reporting the upgrade
+    // state from whenever deck membership last moved. Harmless while the listing carried only
+    // {c, id}; a stale wrong value the moment it started carrying `up`.
+    //
+    // The listing is EMITTED now rather than only held for final_deck. Two reasons: a deck
+    // timeline is what a consumer needs to know when a card was upgraded without replaying
+    // every row, and — the load-bearing one — a reload can only be bridged against a listing
+    // that is recent. Held in memory it dies with the process; the newest listing before a
+    // reload was otherwise the previous header's, which is stale by a whole session.
     private static void RefreshDeckIfChanged(Snapshot s)
     {
         if (_journal == null) return;
-        var sig = 17;
-        foreach (var d in s.Deck) sig = unchecked(sig * 31 + (d.Id?.GetHashCode() ?? 0));
+        var sig = DeckSignature(s);
         if (sig == _deckSig && s.Deck.Count == _deckCount) return;
         _deckSig = sig;
         _deckCount = s.Deck.Count;
         _deckSnapshot = LiveDeck();
+        Line("deck")?.Set("cards", _deckSnapshot).Emit();
+    }
+
+    // Folded from the snapshot rather than the live cards: this runs on every tick, and the
+    // snapshot already carries exactly the three things the key depends on.
+    private static int DeckSignature(Snapshot s)
+    {
+        var sig = 17;
+        foreach (var d in s.Deck)
+        {
+            sig = unchecked(sig * 31 + (d.Id?.GetHashCode() ?? 0));
+            sig = unchecked(sig * 31 + (d.Upgraded ? 1 : 0));
+            sig = unchecked(sig * 31 + (d.Enchantment?.GetHashCode() ?? 0));
+        }
+        return sig;
     }
 
     // Mint instance ids for the deck as it exists at run start. These are the same CardModel
@@ -449,9 +516,14 @@ public static class ReplayRecorder
     // instance ids.
     private static List<ReplayLine> StartingDeck() => LiveDeck();
 
-    private static List<ReplayLine> LiveDeck()
+    private static List<ReplayLine> LiveDeck() => LiveDeck(out _);
+
+    // `entries` is the same deck keyed for DeckRemap, built in this pass so the reflection is
+    // not walked twice and so the live side cannot drift from what the rows say.
+    private static List<ReplayLine> LiveDeck(out List<DeckRemap.Entry> entries)
     {
         var rows = new List<ReplayLine>();
+        entries = new List<DeckRemap.Entry>();
         try
         {
             var deck = Reflect.GetMember(Core.Sts2Access.LivePlayer, "Deck");
@@ -475,14 +547,21 @@ public static class ReplayRecorder
                 // the field" rather than "this card is not upgraded" -- the same reason
                 // replay_version 2 had to be distinguishable from a null coord.
                 var enchantment = Reflect.GetMember(card, "Enchantment");
+                var instance = CardInstances.Of(card);
+                var cardId = Core.Ids.Bare(Reflect.GetString(card, "Id"));
+                var up = Reflect.GetInt(card, "CurrentUpgradeLevel", 0);
+                var enchantId = enchantment == null
+                    ? null : Core.Ids.Bare(Reflect.GetString(enchantment, "Id"));
+                var amount = enchantment == null
+                    ? 0 : Reflect.GetInt(enchantment, "Amount", 0);
                 rows.Add(new ReplayLine("c")
-                    .Set("c", CardInstances.Of(card))
-                    .Set("id", Core.Ids.Bare(Reflect.GetString(card, "Id")))
-                    .Set("up", Reflect.GetInt(card, "CurrentUpgradeLevel", 0))
-                    .Set("enchantment", enchantment == null
-                        ? null : Core.Ids.Bare(Reflect.GetString(enchantment, "Id")))
-                    .Set("amount", enchantment == null
-                        ? (int?)null : Reflect.GetInt(enchantment, "Amount", 0)));
+                    .Set("c", instance)
+                    .Set("id", cardId)
+                    .Set("up", up)
+                    .Set("enchantment", enchantId)
+                    .Set("amount", enchantment == null ? (int?)null : amount));
+                entries.Add(new DeckRemap.Entry(
+                    instance, ReplayJournalScan.Key(cardId, up, enchantId, amount)));
             }
         }
         catch { }

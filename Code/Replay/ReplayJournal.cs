@@ -75,6 +75,10 @@ internal sealed class ReplayJournal : IDisposable
     public int LastCardId { get; }
     public int LastDecisionId { get; }
 
+    // The last full deck listing already in the file, raw. Null on a new run. The recorder
+    // aligns the resumed deck against it to bridge instance ids across the reload.
+    public string? DeckLine { get; }
+
     private ReplayJournal(string path)
     {
         Path = path;
@@ -91,6 +95,7 @@ internal sealed class ReplayJournal : IDisposable
         _seq = prior.Seq + 1;
         LastCardId = prior.Card;
         LastDecisionId = prior.Decision;
+        DeckLine = prior.DeckLine;
         _channel = Channel.CreateBounded<ReplayLine>(new BoundedChannelOptions(QueueCapacity)
         {
             // Wait, NOT DropWrite. This is the mode that makes overflow OBSERVABLE.
