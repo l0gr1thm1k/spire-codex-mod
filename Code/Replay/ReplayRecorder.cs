@@ -272,7 +272,13 @@ public static class ReplayRecorder
             // 3  adds the move line (what an enemy actually did), src on power and block, block
             //    for monsters as well as the player, and an hp line on heals so a rest site
             //    records the amount rather than only the option taken.
-            ?.Set("replay_version", 4)
+            // 5  adds the pick line (the cards a selection screen returned, for every screen
+            //    rather than only deck removal) and the enchant line (which card an
+            //    enchantment landed on, how much, and the pile it was in), plus
+            //    deck_select_enchant as a decision_type. Enchantment had no witness of any
+            //    kind before this, so a 4 reader cannot tell an enchanted deck from a plain
+            //    one; everything here is additive and a 4 reader is otherwise unaffected.
+            ?.Set("replay_version", 5)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
             // The .run records the bare version ("v0.111.0"); Sts2Version.Current carries the
