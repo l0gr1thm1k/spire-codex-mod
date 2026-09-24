@@ -115,4 +115,34 @@ internal static class Reflect
         catch { /* fall through to null */ }
         return null;
     }
+
+    // --- resolve-once members -------------------------------------------------------
+    //
+    // The helpers above collapse "the game has no such member" and "the member read null"
+    // into the same null. That is the right trade for a snapshot field, where both cases
+    // mean "we do not know". It is the WRONG trade when the null value is itself meaningful:
+    // CardSelectCmd.Selector reads null precisely when a human made the choice, so a caller
+    // that cannot tell a renamed property from a null one would have to guess, and a guessed
+    // field is worse than a missing one. These resolve the member once and hand back the
+    // reflection handle, so a caller can emit nothing at all when the member is gone.
+
+    public static PropertyInfo? StaticProperty(Type? type, string name)
+    {
+        if (type == null) return null;
+        try
+        {
+            return type.GetProperty(
+                name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        }
+        catch { return null; }
+    }
+
+    // Guarded reads off an already-resolved handle, so the try/catch lives here rather than
+    // at every call site. A throwing member reads as null, same contract as GetMember.
+    public static object? Read(PropertyInfo? prop)
+    {
+        if (prop == null) return null;
+        try { return prop.GetValue(null); }
+        catch { return null; }
+    }
 }
