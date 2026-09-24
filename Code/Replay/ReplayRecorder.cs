@@ -41,6 +41,9 @@ public static class ReplayRecorder
     // nothing, and a stackable enchantment raising `amount` keeps the same enchantment id.
     // Either way the listing would keep reporting the earlier state as current.
     private static volatile bool _deckDirty;
+    // The keyed form of whatever _deckSnapshot last held. Kept so an in-process reload can be
+    // aligned against the listing that preceded it with no file read at all.
+    private static List<DeckRemap.Entry>? _deckKeys;
 
     // Signature of the merchant stock last written, so a shop line is emitted when the screen
     // opens and again whenever the stock actually changes (a purchase, a restock, a price
@@ -138,6 +141,7 @@ public static class ReplayRecorder
             _deckCount = -1;
             _deckSig = 0;
             _deckDirty = false;
+            _deckKeys = null;
             if (string.IsNullOrEmpty(seed)) return;
             _lastInRun = snapshot;
 
@@ -492,13 +496,97 @@ public static class ReplayRecorder
     private static void RefreshDeckIfChanged(Snapshot s)
     {
         if (_journal == null) return;
+        if (DeckWasRenumbered())
+        {
+            RemapAfterInProcessReload(s);
+            return;
+        }
         var sig = DeckSignature(s);
         if (!_deckDirty && sig == _deckSig && s.Deck.Count == _deckCount) return;
         _deckDirty = false;
         _deckSig = sig;
         _deckCount = s.Deck.Count;
-        _deckSnapshot = LiveDeck();
+        _deckSnapshot = LiveDeck(out var keys);
+        _deckKeys = keys;
         Line("deck")?.Set("cards", _deckSnapshot).Emit();
+    }
+
+    // An in-process reload: quit to the menu and Continue, or load a save, without the process
+    // ever dying.
+    //
+    // This is the common reload and NOTHING saw it. The journal only reopens when the seed
+    // changes, so no header, no resume marker and no remap were written; meanwhile the game
+    // rebuilt every CardModel from the save, CardInstances minted a fresh id for each, and the
+    // deck silently renumbered mid-file. Measured on a real 47-floor run: three of these, none
+    // of them marked. (The ids never COLLIDED -- the counter is in-process and monotonic -- so
+    // this was lost lineage, not a wrong value.)
+    //
+    // DeckSignature cannot see it: it is folded from the snapshot's (id, upgraded,
+    // enchantment) and a renumber changes none of those. So probe object identity instead, and
+    // do it on ONE card: a reload replaces all of them at once, so the first is as good a
+    // witness as the whole deck and costs two reflection reads instead of fifty.
+    //
+    // Catching it AT THE MOMENT it happens is what makes it worth doing. On the same run, the
+    // one reload that happened to be followed immediately by a deck listing aligned exactly --
+    // 26 of 26 cards, three Strikes and four Defends included. The two that were only noticed
+    // at the next deck change had drifted by then and left 8 and 5 cards unmappable.
+    private static bool DeckWasRenumbered()
+    {
+        try
+        {
+            if (_deckKeys == null || _deckKeys.Count == 0) return false;
+            var deck = Reflect.GetMember(Core.Sts2Access.LivePlayer, "Deck");
+            if (Reflect.GetMember(deck, "Cards") is not System.Collections.IEnumerable cards)
+                return false;
+            foreach (var card in cards)
+            {
+                if (card == null) continue;
+                return !CardInstances.Known(card);
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    // Align the renumbered deck against the listing that preceded it and state the mapping.
+    // The probe above is only a trigger: this re-reads the deck and confirms the id sets are
+    // genuinely disjoint before writing anything, so a card that merely arrived without a
+    // minting hook costs one extra read rather than producing a bogus remap.
+    private static void RemapAfterInProcessReload(Snapshot s)
+    {
+        var before = _deckKeys;
+        if (before == null || before.Count == 0) return;
+        var rows = LiveDeck(out var after);
+        if (after.Count == 0) return;
+
+        var known = new HashSet<int>();
+        foreach (var entry in before) known.Add(entry.C);
+        foreach (var entry in after)
+            if (known.Contains(entry.C))
+                return; // not a renumber; the ordinary signature path owns this change
+
+        var result = DeckRemap.Align(before, after);
+        _deckSnapshot = rows;
+        _deckKeys = after;
+        _deckDirty = false;
+        _deckSig = DeckSignature(s);
+        _deckCount = after.Count;
+
+        if (result.Pairs.Count > 0 || result.Ambiguous > 0)
+        {
+            var pairs = new List<ReplayLine>();
+            foreach (var pair in result.Pairs)
+                pairs.Add(new ReplayLine("m").Set("from", pair.From).Set("to", pair.To));
+            Line("remap")
+                ?.Set("cards", pairs.Count > 0 ? pairs : null)
+                .Set("ambiguous", result.Ambiguous > 0 ? result.Ambiguous : (int?)null)
+                .SetFlag("exact", result.Exact)
+                // Distinguishes this from the remap written when the PROCESS restarted: that
+                // one has a header and a resume row beside it, this one has neither.
+                .SetFlag("in_process", true)
+                .Emit();
+        }
+        Line("deck")?.Set("cards", rows).Emit();
     }
 
     // Re-read the deck on the next tick. Called from the hooks for upgrade and enchantment,
