@@ -44,6 +44,10 @@ public static class ReplayRecorder
     // The keyed form of whatever _deckSnapshot last held. Kept so an in-process reload can be
     // aligned against the listing that preceded it with no file read at all.
     private static List<DeckRemap.Entry>? _deckKeys;
+    // The first card OBJECT of the listing above. A reload replaces every CardModel, so this
+    // reference going stale is the signal; see DeckWasRenumbered for why identity beats asking
+    // CardInstances whether the card is known.
+    private static WeakReference<object>? _deckFirst;
 
     // Signature of the merchant stock last written, so a shop line is emitted when the screen
     // opens and again whenever the stock actually changes (a purchase, a restock, a price
@@ -142,6 +146,7 @@ public static class ReplayRecorder
             _deckSig = 0;
             _deckDirty = false;
             _deckKeys = null;
+            _deckFirst = null;
             if (string.IsNullOrEmpty(seed)) return;
             _lastInRun = snapshot;
 
@@ -508,6 +513,7 @@ public static class ReplayRecorder
         _deckCount = s.Deck.Count;
         _deckSnapshot = LiveDeck(out var keys);
         _deckKeys = keys;
+        _deckFirst = NewDeckReference();
         Line("deck")?.Set("cards", _deckSnapshot).Emit();
     }
 
@@ -535,17 +541,38 @@ public static class ReplayRecorder
         try
         {
             if (_deckKeys == null || _deckKeys.Count == 0) return false;
-            var deck = Reflect.GetMember(Core.Sts2Access.LivePlayer, "Deck");
-            if (Reflect.GetMember(deck, "Cards") is not System.Collections.IEnumerable cards)
-                return false;
-            foreach (var card in cards)
-            {
-                if (card == null) continue;
-                return !CardInstances.Known(card);
-            }
+            var live = FirstDeckCard();
+            if (live == null) return false;
+            // Reference identity, NOT CardInstances.Known. A combat clone mints its SOURCE
+            // deck card's id -- LinkClone falls through to OfLocked(source) -- so a reload that
+            // drops straight back into a fight can have every deck card already known by the
+            // time the producer ticks, and a Known-based probe would miss the renumber
+            // completely. The object itself is what the reload replaces, so compare that.
+            if (_deckFirst != null && _deckFirst.TryGetTarget(out var prior))
+                return !ReferenceEquals(prior, live);
+            // No reference to compare against (first listing, or the card was collected):
+            // let the handler look, and it will refresh the reference either way.
+            return true;
         }
         catch { }
         return false;
+    }
+
+    private static WeakReference<object>? NewDeckReference()
+    {
+        var first = FirstDeckCard();
+        return first == null ? null : new WeakReference<object>(first);
+    }
+
+    private static object? FirstDeckCard()
+    {
+        var deck = Reflect.GetMember(Core.Sts2Access.LivePlayer, "Deck");
+        if (Reflect.GetMember(deck, "Cards") is not System.Collections.IEnumerable cards)
+            return null;
+        foreach (var card in cards)
+            if (card != null)
+                return card;
+        return null;
     }
 
     // Align the renumbered deck against the listing that preceded it and state the mapping.
@@ -563,11 +590,17 @@ public static class ReplayRecorder
         foreach (var entry in before) known.Add(entry.C);
         foreach (var entry in after)
             if (known.Contains(entry.C))
-                return; // not a renumber; the ordinary signature path owns this change
+            {
+                // Not a renumber -- the ordinary signature path owns this change. Re-anchor the
+                // reference anyway: leaving it stale would re-trigger this full read every tick.
+                _deckFirst = NewDeckReference();
+                return;
+            }
 
         var result = DeckRemap.Align(before, after);
         _deckSnapshot = rows;
         _deckKeys = after;
+        _deckFirst = NewDeckReference();
         _deckDirty = false;
         _deckSig = DeckSignature(s);
         _deckCount = after.Count;
