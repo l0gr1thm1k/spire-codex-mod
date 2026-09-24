@@ -1365,6 +1365,9 @@ internal static class ReplayHooks
     {
         try
         {
+            // The deck listing must re-read: this changes card state without
+            // changing membership, which the deck signature cannot see.
+            ReplayRecorder.MarkDeckChanged();
             ReplayRecorder.Line("upgrade")
                 ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
                 .Set("option_index", SelectIndexOf(__0))
@@ -1401,6 +1404,9 @@ internal static class ReplayHooks
             var offered = _decisionType == EnchantSelectType;
             var optionIndex = offered ? SelectIndexOf(__1) : null;
 
+            // The deck listing must re-read: this changes card state without
+            // changing membership, which the deck signature cannot see.
+            ReplayRecorder.MarkDeckChanged();
             ReplayRecorder.Line("enchant")
                 ?.Set("decision_id", optionIndex != null ? _decision : (int?)null)
                 .Set("option_index", optionIndex)

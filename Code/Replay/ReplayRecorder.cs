@@ -35,6 +35,12 @@ public static class ReplayRecorder
     private static List<ReplayLine>? _deckSnapshot;
     private static int _deckCount = -1;
     private static int _deckSig;
+    // Set by the hooks that change a card's STATE without changing deck membership. The
+    // snapshot signature cannot see those: DeckEntry carries Upgraded as a bool while the
+    // listing writes CurrentUpgradeLevel as an int, so a second upgrade on one card moves
+    // nothing, and a stackable enchantment raising `amount` keeps the same enchantment id.
+    // Either way the listing would keep reporting the earlier state as current.
+    private static volatile bool _deckDirty;
 
     // Signature of the merchant stock last written, so a shop line is emitted when the screen
     // opens and again whenever the stock actually changes (a purchase, a restock, a price
@@ -131,6 +137,7 @@ public static class ReplayRecorder
             _deckSnapshot = null;
             _deckCount = -1;
             _deckSig = 0;
+            _deckDirty = false;
             if (string.IsNullOrEmpty(seed)) return;
             _lastInRun = snapshot;
 
@@ -142,6 +149,7 @@ public static class ReplayRecorder
             _deckSnapshot = null;
             _deckCount = -1;
             _deckSig = 0;
+            _deckDirty = false;
 
             // Identity must match the .run EXACTLY. The upload endpoint 409s on a header whose
             // seed / start_time / character disagree with the run doc, and both were wrong:
@@ -485,15 +493,23 @@ public static class ReplayRecorder
     {
         if (_journal == null) return;
         var sig = DeckSignature(s);
-        if (sig == _deckSig && s.Deck.Count == _deckCount) return;
+        if (!_deckDirty && sig == _deckSig && s.Deck.Count == _deckCount) return;
+        _deckDirty = false;
         _deckSig = sig;
         _deckCount = s.Deck.Count;
         _deckSnapshot = LiveDeck();
         Line("deck")?.Set("cards", _deckSnapshot).Emit();
     }
 
-    // Folded from the snapshot rather than the live cards: this runs on every tick, and the
-    // snapshot already carries exactly the three things the key depends on.
+    // Re-read the deck on the next tick. Called from the hooks for upgrade and enchantment,
+    // which are the changes DeckSignature is structurally blind to; membership changes
+    // (acquire, remove, transform) move the signature on their own.
+    public static void MarkDeckChanged() => _deckDirty = true;
+
+    // Folded from the snapshot rather than the live cards, because this runs on every tick and
+    // Reflect does no member caching -- walking ~25 cards per tick to read upgrade level would
+    // double an already-reflective hot path. The snapshot is free here, and MarkDeckChanged
+    // covers what it cannot express.
     private static int DeckSignature(Snapshot s)
     {
         var sig = 17;
