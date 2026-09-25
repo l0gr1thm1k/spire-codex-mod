@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System;
+using System.Reflection;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -29,6 +30,24 @@ internal static class ReplayHooks
     // join to the right decision.
     private static int _decision;
     private static string? _decisionType;
+
+    // Who actually answered a selection screen, resolved once at install.
+    //
+    // CardSelectCmd.Selector is non-null whenever something other than a human is choosing.
+    // Whispering Earring pushes a VakuuCardSelector and autoplays up to 13 cards; AutoSlay
+    // (the game's own smoke-test harness) pushes an AutoSlayCardSelector for a whole run. Both
+    // resolve through Selector.GetSelectedCards and then fall into the same LogChoice we
+    // prefix, so without this the journal presents a machine's pick as the player's own.
+    //
+    // A co-op partner's screens are separated by the mod's existing LocalPlayer helper. Both
+    // clients process both players' selections: when the partner picks, CardSelectCmd here
+    // takes the WaitForRemoteChoice branch and still calls LogChoice, so their pick lands in
+    // our journal looking like ours.
+    //
+    // Held as reflection handles rather than read through Reflect.GetStatic because null is a
+    // MEANINGFUL value here -- Selector reads null exactly when the human chose -- and a
+    // renamed member must be distinguishable from that. Unresolved means the field is omitted.
+    private static PropertyInfo? _selectorProp;
 
     // What OpenSelectOffer composes for the enchantment screen, "deck_select" + "enchant".
     // Named because CardEnchanted has to tell an enchant offer from any other open select
@@ -355,6 +374,16 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRestSiteSmith", me, nameof(RestSmith));
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Events.EventOption"),
                                  "Chosen", me, nameof(EventOptionChosen), 0);
+
+        // Not Harmony patches, so deliberately outside the n/attempted tally: these are plain
+        // member lookups whose absence costs two fields on one row, not a whole line kind.
+        // The Player argument for the overload match comes from the first pick, so IsMe
+        // resolves lazily in SelectionReturned; only the property can be resolved here.
+        _selectorProp = Reflect.StaticProperty(
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"), "Selector");
+        if (_selectorProp == null)
+            MainFile.Logger.Info("replay-hooks: CardSelectCmd.Selector not found; "
+                                 + "pick rows will omit `selector`");
 
         MainFile.Logger.Info($"replay-hooks: {n}/{attempted} patched");
     }
@@ -1167,7 +1196,7 @@ internal static class ReplayHooks
     // guaranteed to see the full set. Re-enumerating is safe by construction because the game
     // already does it twice: every entry point ends `LogChoice(player, enumerable); return
     // enumerable;` and its own caller then enumerates what came back.
-    private static void SelectionReturned(object __1)
+    private static void SelectionReturned(object __0, object __1)
     {
         try
         {
@@ -1200,11 +1229,35 @@ internal static class ReplayHooks
                 ?.Set("decision_id", joined ? _decision : (int?)null)
                 .Set("decision_type", joined ? _decisionType : null)
                 .Set("n_picked", picked.Count)
+                // WHO answered. Both are omitted rather than defaulted when the member behind
+                // them is gone, so their absence dates a capture and never asserts "a human
+                // chose" -- see the _selectorProp comment.
+                .Set("selector", SelectorName())
+                .Set("mine", Mine(__0))
                 .Set("cards", picked)
                 .Emit();
         }
         catch { }
     }
+
+    // "human" when the game says no selector is installed, the selector's type name when one
+    // is, and null when we could not resolve the property at all. Spelling the human case
+    // explicitly rather than leaving the field off is what makes an absent `selector` mean
+    // "this capture predates the field" instead of being indistinguishable from it.
+    private static string? SelectorName()
+    {
+        if (_selectorProp == null) return null;
+        var selector = Reflect.Read(_selectorProp);
+        return selector == null ? "human" : selector.GetType().Name;
+    }
+
+    // Whether our own player made this selection; false is a co-op partner's pick.
+    //
+    // Emitted ONLY in co-op. In single-player every pick is ours, so the field would be a
+    // constant true on every row and say nothing. `selector` is the one that dates a capture,
+    // because it is always written.
+    private static bool? Mine(object? player)
+        => LocalPlayer.IsCoop ? LocalPlayer.IsLocalPlayer(player) : (bool?)null;
 
     private static void CardRemoved(object __1)
     {
