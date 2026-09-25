@@ -53,6 +53,24 @@ internal static class CardInstances
         }
     }
 
+    // Continue numbering above ids a previous session of this run already wrote.
+    //
+    // A reload rebuilds every CardModel from the save, so the objects this table keys on are
+    // gone and their identity genuinely cannot be recovered -- the game has no per-instance id
+    // of its own for us to re-key on (see the note at the top of this file). What CAN be
+    // avoided is the second failure: minting id 7 again for a DIFFERENT card in the same
+    // journal, which reads downstream as one card that teleported rather than two cards. So a
+    // resumed session starts above the previous high-water mark. Ids stay unique within a run;
+    // the seam is visible as a gap, and a consumer that needs to bridge it matches the resumed
+    // header's deck rather than trusting a repeated number.
+    //
+    // Called immediately after Reset on the resume path, before any hook can mint.
+    public static void ResumeFrom(int highWater)
+    {
+        if (highWater <= 0) return;
+        lock (Gate) { if (highWater > _next) _next = highWater; }
+    }
+
     // The run-scoped id for this card object, minting one on first sight. Returns 0 for null
     // so a failed reflection read degrades to "unknown instance" instead of throwing into a
     // game hook.
