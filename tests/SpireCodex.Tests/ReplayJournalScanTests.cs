@@ -40,6 +40,41 @@ public sealed class ReplayJournalScanTests
     }
 
     [Fact]
+    public void ResumesTheCreatureIdFromEveryKeyThatCarriesOne()
+    {
+        // Creature ids arrive on six different keys and the highest wins, wherever it appeared.
+        // Without this a second session restarts at 1 and hands the first fight's enemy id to a
+        // different body: observed on run 9WWFYZ7FT7L2, where the fights before a reload used
+        // cids 1..10 and the fights after it began again at 1.
+        var path = WriteJournal(
+            """{"t":"combat_start","s":0,"enemies":[{"i":0,"cid":3,"id":"CORPSE_SLUG"}]}""",
+            """{"t":"play","s":1,"target_cid":4}""",
+            """{"t":"hit","s":2,"src_cid":5,"dst_cid":9}""",
+            """{"t":"power","s":3,"src_cid":6,"tgt_cid":7}""",
+            """{"t":"move","s":4,"src_cid":2}""");
+
+        var hw = ReplayJournalScan.HighWaterOf(path);
+        File.Delete(path);
+
+        Assert.Equal(9, hw.Creature); // dst_cid, not the last one seen
+    }
+
+    [Fact]
+    public void DoesNotReadACreatureIdOffAKeyThatMerelyEndsInCid()
+    {
+        // The needle carries the opening quote, so "cid" must not also match "target_cid" -- and
+        // a key nobody mints ids on must not raise the mark. If the quote were dropped, the
+        // 4000 below would be read as a creature id and the next session would skip past it.
+        var path = WriteJournal(
+            """{"t":"play","s":1,"target_cid":4,"not_a_cid":4000}""");
+
+        var hw = ReplayJournalScan.HighWaterOf(path);
+        File.Delete(path);
+
+        Assert.Equal(4, hw.Creature);
+    }
+
+    [Fact]
     public void DoesNotConfuseAKeyWithOneThatEndsInIt()
     {
         // deck_c is far larger than any real c, and stars_paid/ms far larger than any s. If the

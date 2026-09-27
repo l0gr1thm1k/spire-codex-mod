@@ -74,6 +74,7 @@ internal sealed class ReplayJournal : IDisposable
     // an id the earlier session already used. See ReplayJournalScan.HighWaterOf.
     public int LastCardId { get; }
     public int LastDecisionId { get; }
+    public int LastCreatureId { get; }
 
     // The last full deck listing already in the file, raw. Null on a new run. The recorder
     // aligns the resumed deck against it to bridge instance ids across the reload.
@@ -95,6 +96,7 @@ internal sealed class ReplayJournal : IDisposable
         _seq = prior.Seq + 1;
         LastCardId = prior.Card;
         LastDecisionId = prior.Decision;
+        LastCreatureId = prior.Creature;
         DeckLine = prior.DeckLine;
         _channel = Channel.CreateBounded<ReplayLine>(new BoundedChannelOptions(QueueCapacity)
         {
@@ -285,6 +287,11 @@ internal sealed class ReplayJournal : IDisposable
                 w.WriteStartArray(key);
                 foreach (var item in ints) w.WriteNumberValue(item);
                 w.WriteEndArray();
+                break;
+            case ReplayLine nested: // a single nested object (rng_state)
+                w.WriteStartObject(key);
+                foreach (var (k, v) in nested.Fields) WriteField(w, k, v);
+                w.WriteEndObject();
                 break;
             case IEnumerable<ReplayLine> rows: // nested option/entity rows
                 w.WriteStartArray(key);

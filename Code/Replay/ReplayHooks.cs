@@ -134,6 +134,8 @@ internal static class ReplayHooks
         _hpLostInCombat = null;
         _selectByInstance = null;
         _selected = null;
+        _selectDecision = 0;
+        _selectDecisionType = null;
     }
 
     // MerchantEntry.OnTryPurchaseWrapper(inventory, ignoreCost) — fires on the ATTEMPT, so the
@@ -204,12 +206,16 @@ internal static class ReplayHooks
     private static void FlushSelectOutcome()
     {
         var picked = _selected;
+        var owner = _selectDecision;
+        var ownerType = _selectDecisionType;
         _selected = null;
         _selectByInstance = null;
-        if (picked == null || _decision <= 0) return;
+        _selectDecision = 0;
+        _selectDecisionType = null;
+        if (picked == null || owner <= 0) return;
         ReplayRecorder.Line("outcome")
-            ?.Set("decision_id", _decision)
-            .Set("decision_type", _decisionType)
+            ?.Set("decision_id", owner)
+            .Set("decision_type", ownerType)
             .Set("outcome", picked.Count > 0 ? "select" : "decline")
             .Set("selected_option_indices", picked)
             .Set("n_selected", picked.Count)
@@ -367,6 +373,15 @@ internal static class ReplayHooks
         // Relics, potions, events, rest.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
                                  "Obtain", me, nameof(RelicObtained), 3);
+        // Departures. Postfix, so the row is written against a removal that already happened:
+        // Remove() does its work before its first await, so by the time the postfix runs the
+        // relic is out of the player's list.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
+                                 "Remove", me, nameof(RelicRemoved), 1, postfix: true);
+        // Replace() calls Remove() then Obtain(), so it needs no emitter of its own -- only a
+        // marker, so the pair it produces is readable as one swap rather than two coincidences.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
+                                 "Replace", me, nameof(RelicReplacing), 2);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionUsed", me, nameof(PotionUsed));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionProcured", me, nameof(PotionProcured));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionDiscarded", me, nameof(PotionDiscarded));
@@ -550,6 +565,10 @@ internal static class ReplayHooks
                 .Where(x => x != null).ToList();
             ReplayRecorder.Line("move")
                 ?.Set("src", CreatureRef(owner))
+                // Which enemy is about to act. In a fight with two of the same monster the two
+                // intent lines were indistinguishable, so the move could not be attributed to
+                // the body that then dealt the damage.
+                .Set("src_cid", CreatureSlots.Maybe(owner))
                 .Set("id", Reflect.GetString(__instance, "StateId"))
                 .Set("intents", intents.Count > 0 ? intents : null)
                 .Emit();
@@ -595,6 +614,17 @@ internal static class ReplayHooks
     private static Dictionary<int, int>? _selectByInstance;
     private static List<int>? _selected;
 
+    // The decision that offer belongs to, captured when it OPENS.
+    //
+    // The outcome used to be written against whatever `_decision` held at flush time, which is
+    // only the same decision when nothing has opened in between. Selections resolve
+    // asynchronously, so a pick can land after the next decision is already open, and the
+    // outcome then reported a deck select's `selected_option_indices` under an unrelated
+    // `event` -- the one class of mis-join this record exists to prevent, and the reason
+    // `_prevDecision` exists for resolutions. Holding the owner makes flush order irrelevant.
+    private static int _selectDecision;
+    private static string? _selectDecisionType;
+
     // The one full board keyframe per fight. Everything after it is deltas.
     private static void CombatStart(object __1)
     {
@@ -627,14 +657,33 @@ internal static class ReplayHooks
             foreach (var e in Enumerate(Reflect.GetMember(__1, "Enemies")))
             {
                 enemies.Add(new ReplayLine("e")
+                    // `i` keeps the meaning it has always had: this enemy's POSITION in the list,
+                    // 0..n-1, left to right. Unchanged, because released readers already parse it.
                     .Set("i", i++)
+                    // `cid` is the body's identity, and is what every `*_cid` elsewhere refers to.
+                    // Deliberately not the same thing as `i`: position is per fight and shifts as
+                    // enemies die, identity is per run and never moves.
+                    .Set("cid", CreatureSlots.Maybe(e))
                     .Set("id", Ids.Bare(Reflect.GetString(e, "ModelId")))
+                    // The game's OWN name for this position, when the encounter defines one (only
+                    // 19 of 98 do). Absent everywhere else, so it cannot serve as the identity --
+                    // but where present it ties `cid` to what the player sees on screen, and is
+                    // how a consumer can check the two agree.
+                    .Set("slot", Reflect.GetString(e, "SlotName"))
                     .Set("hp", Reflect.GetInt(e, "CurrentHp", 0))
                     .Set("max_hp", Reflect.GetInt(e, "MaxHp", 0)));
             }
             line.Set("combat_id", _combatId)
                 .Set("attempt_id", ReplayRecorder.AttemptId)
                 .Set("encounter", encounter)
+                // The run's position in every random stream, at a precisely defined instant.
+                // This is a Harmony PREFIX on Hook.BeforeCombatStart, which CombatManager calls
+                // after the encounter's creatures are added and before StartTurn -- so the
+                // counters are stamped before turn 1's shuffle and deal, and before any relic's
+                // own BeforeCombatStart (Snecko Eye, Byrdpip) has drawn. A fight can therefore
+                // be graded from its stated position rather than from a position inferred by
+                // replaying every fight before it.
+                .Set("rng_state", RngState.Read())
                 .Set("enemies", enemies)
                 .Emit();
         }
@@ -744,10 +793,13 @@ internal static class ReplayHooks
                 .Set("deck_c", origin > 0 ? origin : (int?)null)
                 .Set("id", Ids.Bare(Reflect.GetString(card, "Id")))
                 .Set("up", Reflect.GetInt(card, "CurrentUpgradeLevel", 0))
-                // Model id only. Minting a CardInstances id for a Creature would consume ids
-                // from the card sequence and corrupt card_instances downstream, so two
-                // identical enemies are deliberately not distinguished here.
+                // Model id AND slot. The id alone names a species, so against two Corpse Slugs
+                // every targeted play read CORPSE_SLUG and which one took it was unrecoverable.
+                // The old objection here -- that minting a CardInstances id for a Creature would
+                // consume ids from the card sequence and corrupt card_instances downstream --
+                // is answered by CreatureSlots keeping a sequence of its own.
                 .Set("target", target == null ? null : Ids.Bare(Reflect.GetString(target, "ModelId")))
+                .Set("target_cid", CreatureSlots.Maybe(target))
                 .Set("cost_paid", Reflect.GetInt(resources, "EnergySpent", -1))
                 .Set("stars_paid", Reflect.GetInt(resources, "StarsSpent", 0))
                 .SetFlag("auto", Reflect.GetBool(__1, "IsAutoPlay"))
@@ -835,7 +887,11 @@ internal static class ReplayHooks
                 // read. Naming it keeps that distinguishable from a failed reflection.
                 ?.Set("src", dealerIsPlayer ? "player"
                         : __2 == null ? "effect" : Ids.Bare(Reflect.GetString(__2, "ModelId")))
+                .Set("src_cid", CreatureSlots.Maybe(__2))
                 .Set("dst", targetIsPlayer ? "player" : Ids.Bare(Reflect.GetString(__5, "ModelId")))
+                // Which body took it. Without this, two of the same enemy share one `dst` and
+                // the kill order in a multi-enemy fight is not recoverable from the journal.
+                .Set("dst_cid", CreatureSlots.Maybe(__5))
                 .Set("dmg", Reflect.GetInt(__3, "UnblockedDamage", 0))
                 .Set("blocked", Reflect.GetInt(__3, "BlockedDamage", 0))
                 .SetFlag("killed", Reflect.GetBool(__3, "WasTargetKilled"))
@@ -867,14 +923,19 @@ internal static class ReplayHooks
     {
         try
         {
+            var owner = Reflect.GetMember(__2, "Owner");
             ReplayRecorder.Line("power")
                 // Who applied it. Without this a relic or thorns ticking on the enemy turn
                 // looked identical to a monster buffing itself, because tgt was the only clue.
                 // Same convention as hit.src: a null applier is an effect, not a failed read.
                 ?.Set("src", CreatureRef(__4))
+                .Set("src_cid", CreatureSlots.Maybe(__4))
                 .Set("id", Ids.Bare(Reflect.GetString(__2, "Id")))
                 .Set("n", (int)__3)
-                .Set("tgt", Ids.Bare(Reflect.GetString(Reflect.GetMember(__2, "Owner"), "ModelId")))
+                .Set("tgt", Ids.Bare(Reflect.GetString(owner, "ModelId")))
+                // Which body carries the debuff. `tgt` alone said CORPSE_SLUG for a Weak that
+                // only one of the two slugs actually had.
+                .Set("tgt_cid", CreatureSlots.Maybe(owner))
                 .Emit();
         }
         catch { }
@@ -910,6 +971,7 @@ internal static class ReplayHooks
             // journal at all and the turn read as "nothing recorded".
             ReplayRecorder.Line("block")
                 ?.Set("src", CreatureRef(__1))
+                .Set("src_cid", CreatureSlots.Maybe(__1))
                 .Set("n", (int)__2)
                 .Set("card", __4 == null ? null : Ids.Bare(Reflect.GetString(__4, "Id")))
                 .Emit();
@@ -1036,7 +1098,7 @@ internal static class ReplayHooks
         {
             _pendingReroll++;
             ReplayRecorder.Line("outcome")
-                ?.Set("decision_id", _decision)
+                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
                 .Set("decision_type", _decisionType)
                 .Set("outcome", "reroll")
                 .Set("offer_generation", _pendingReroll - 1)
@@ -1140,6 +1202,8 @@ internal static class ReplayHooks
         // if the player picks nothing.
         _selectByInstance = new Dictionary<int, int>();
         _selected = new List<int>();
+        _selectDecision = _decision;
+        _selectDecisionType = _decisionType;
 
         var options = new List<ReplayLine>();
         var i = 0;
@@ -1226,8 +1290,13 @@ internal static class ReplayHooks
                 // three rooms back claiming to be the Retain pick. An unjoined pick names its
                 // cards and stays silent about the offer; `outcome` remains the authority on
                 // whether a recorded offer was declined.
-                ?.Set("decision_id", joined ? _decision : (int?)null)
-                .Set("decision_type", joined ? _decisionType : null)
+                // The OFFER's decision, not whatever is open now. `joined` is proof the card
+                // was in _selectByInstance, so the offer that map belongs to is definitionally
+                // the owner -- and the `outcome` row for this same selection is written against
+                // the same field, so using `_decision` here could have the pick and the outcome
+                // name two different decisions for one screen.
+                ?.Set("decision_id", joined ? _selectDecision : (int?)null)
+                .Set("decision_type", joined ? _selectDecisionType : null)
                 .Set("n_picked", picked.Count)
                 // WHO answered. Both are omitted rather than defaulted when the member behind
                 // them is gone, so their absence dates a capture and never asserts "a human
@@ -1264,7 +1333,7 @@ internal static class ReplayHooks
         try
         {
             ReplayRecorder.Line("remove")
-                ?.Set("decision_id", _decision)
+                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
                 .Set("option_index", SelectIndexOf(__1))
                 .Set("c", CardInstances.Of(__1))
                 .Set("id", Ids.Bare(Reflect.GetString(__1, "Id")))
@@ -1413,8 +1482,16 @@ internal static class ReplayHooks
                 // decision in this schema; the buy line's `slot` names which entry was taken.
                 // It was inheriting the open decision, and a card-removal select stays open for
                 // the rest of the visit, so a purchased card read as one of its picks.
+                // A select that only TAKES cards can never be the decision that gave one.
+                // WELLSPRING opens a removal screen and then grants a curse, so GUILTY arrived
+                // pointing at the screen that had just removed a Strike -- reading as though a
+                // removal offer had handed the player a curse. The event is the real grantor
+                // and `source` already says so; attributing it to _prevDecision instead would
+                // be a guess, and an unproven join is what this field refuses to make.
                 ?.Set("decision_id", offered ? decisionForCard
                         : source == "granted" || source == "shop" ? (int?)null
+                        : _decisionType == "deck_select_remove"
+                          || _decisionType == EnchantSelectType ? (int?)null
                         : _decision > 0 ? _decision : (int?)null)
                 .Set("source", source)
                 .Set("c", CardInstances.Of(__2))
@@ -1518,7 +1595,7 @@ internal static class ReplayHooks
         try
         {
             ReplayRecorder.Line("transform")
-                ?.Set("decision_id", _decision)
+                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
                 // The option index belongs to the card that was CHOSEN, which is the one that
                 // was on offer; the replacement was never in the deck when the select opened.
                 .Set("option_index", SelectIndexOf(__0))
@@ -1541,9 +1618,81 @@ internal static class ReplayHooks
             // gate a shop relic claimed whatever screen was open -- a card-removal select
             // stays open for the whole visit, so the relic rendered as one of its options.
             var fromShelf = _pendingBuyKind != null;
+            // A relic keeps its decision only when the open decision is one that can GRANT a
+            // relic. An allow-list, not a deny-list: the shelf gate above only knows about
+            // purchases, and a relic that is simply granted while any card screen is open fell
+            // straight through it. Neow's "remove two cards" select is open as the run's
+            // starting relics arrive, and a combat's card reward is open as its relic drops --
+            // so LARGE_CAPSULE and friends rendered as resolutions of a card-removal offer, and
+            // 95 more relics as resolutions of card rewards, across 28 version-5 journals.
+            //
+            // `event` is the only captured decision type that grants relics today. A relic
+            // reward screen would be another, but nothing records its offer yet (STS-98), so
+            // there is no decision for such a relic to belong to and omitting is correct.
+            // Deciding on the open decision's TYPE asks the right question: not how the relic
+            // arrived, but whether the thing waiting for an answer could produce one at all.
+            var grantable = _decisionType == "event";
             ReplayRecorder.Line("relic")
-                ?.Set("decision_id", !fromShelf && _decision > 0 ? _decision : (int?)null)
+                ?.Set("decision_id",
+                      !fromShelf && grantable && _decision > 0 ? _decision : (int?)null)
                 .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // RelicCmd.Replace(original, replace) prefix. Replace is Remove-then-Obtain, so the only
+    // thing the nested Remove cannot work out for itself is WHY it was called. Same idiom as
+    // _pendingBuyKind, which exists so a relic arriving mid-purchase knows it came off a shelf.
+    private static bool _replacingRelic;
+
+    private static void RelicReplacing() => _replacingRelic = true;
+
+    // RelicCmd.Remove(RelicModel relic) postfix. The journal recorded every relic gained and
+    // none lost, so a run that handed one to Ranwid the Elder read as still holding it for the
+    // rest of the run -- and a relic that changes what every fight does (Red Mask putting Weak
+    // on every enemy at the top of every turn) went on doing it in the model for 28 more floors.
+    //
+    // The only witness before this was the event outcome's display LABEL ("Give Red Mask"),
+    // which is localized, and which in 2 of 6 real cases was the unsubstituted template
+    // "Give {Relic}" -- unreadable in any language.
+    //
+    // Owner survives this point: RemoveRelicInternal -> RelicModel.RemoveInternal() only sets
+    // HasBeenRemovedFromState, so the co-op owner check below still resolves.
+    //
+    // The HasBeenRemovedFromState guard is doing real work, not belt-and-braces. Remove() is an
+    // `async Task`, so a throw inside it is captured on the returned Task instead of
+    // propagating, and a postfix therefore runs even when the removal FAILED --
+    // RemoveRelicInternal throws when the player does not hold the relic. The flag is set by the
+    // removal itself, so it is the one thing on hand that tells the two apart. Without it this
+    // hook would happily record relics that never left.
+    //
+    // Not covered, deliberately: RelicCmd.Melt (ToyBox). A melted relic STAYS in the inventory
+    // and stops working, which is a state change and not a departure; filing it under a "lost"
+    // row would tell a consumer the wrong thing. It needs its own answer.
+    private static void RelicRemoved(object __0)
+    {
+        try
+        {
+            var replacing = _replacingRelic;
+            _replacingRelic = false;
+            if (Reflect.GetMember(__0, "HasBeenRemovedFromState") is not true) return;
+            ReplayRecorder.Line("relic_lost")
+                // Only an event may own a removal. Measured against the game's callers:
+                // RanwidTheElder and RelicTrader go through an event decision, while
+                // SwordOfStone and TouchOfOrobas reach Remove via Replace with no decision open
+                // at all, and the dev console has none either. Without the gate those three
+                // would inherit whichever screen happened to be open, which is the same
+                // mis-join a shop relic used to make.
+                ?.Set("decision_id",
+                      !replacing && _decisionType == "event" && _decision > 0
+                          ? _decision : (int?)null)
+                .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                // "replaced" pairs this with the `relic` row that follows it from the same
+                // swap. Stated rather than left to be inferred from adjacency, which is only
+                // ever a guess about ordering.
+                .Set("reason", replacing ? "replaced" : "removed")
+                .Set("mine", Mine(Reflect.GetMember(__0, "Owner")))
                 .Emit();
         }
         catch { }
@@ -1627,7 +1776,7 @@ internal static class ReplayHooks
             }
 
             ReplayRecorder.Line("outcome")
-                ?.Set("decision_id", _decision)
+                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
                 .Set("decision_type", "event")
                 .Set("outcome", "chosen")
                 .Set("option_id", chosenKey)
