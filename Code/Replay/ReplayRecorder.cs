@@ -232,6 +232,12 @@ public static class ReplayRecorder
                     .Set("hp", snapshot.CurrentHp)
                     .Set("gold", snapshot.Gold)
                     .Set("deck_size", snapshot.DeckSize)
+                    // The restored position, which is the one thing a reload changes that
+                    // nothing else in the stream records. Counters go BACKWARDS here whenever
+                    // the save predates the abandoned attempt, and that rollback is invisible
+                    // otherwise -- a consumer carrying position forward across a resume would
+                    // be wrong by exactly the draws the rolled-back play made.
+                    .Set("rng_state", RngState.Read())
                     .Emit();
             // Bridge instance ids across the reload before anything else references them.
             if (journal.Resumed) EmitDeckRemap(journal);
@@ -357,6 +363,11 @@ public static class ReplayRecorder
             // every Ascender's Bane) — all of which first appear in a draw line.
             .Set("starting_deck", StartingDeck())
             .Set("starting_relics", s.Relics.Select(r => r.Id).ToList())
+            // The run's origin in every random stream. On a genuinely new run these are all 0
+            // and the field says so explicitly rather than leaving a consumer to assume it; on
+            // a resume the header is rewritten mid-run, so they are wherever that session
+            // reopened, which is the anchor for everything before the first combat_start.
+            .Set("rng_state", RngState.Read())
             .Emit();
     }
 
@@ -617,6 +628,14 @@ public static class ReplayRecorder
                 // Distinguishes this from the remap written when the PROCESS restarted: that
                 // one has a header and a resume row beside it, this one has neither.
                 .SetFlag("in_process", true)
+                // The third session boundary, and the only one with no header and no resume
+                // line to carry the position. A quit-to-menu and Continue restores the run
+                // from the save, which rolls the RNG back with it -- observed on a real
+                // journal, where a fight was replayed and `shuffle` came back to the same 32
+                // it started at. Without this row stating the restored position, a consumer
+                // carrying position forward across the reload is wrong by exactly the draws
+                // the abandoned attempt made, and nothing in the stream says so.
+                .Set("rng_state", RngState.Read())
                 .Emit();
         }
         Line("deck")?.Set("cards", rows).Emit();

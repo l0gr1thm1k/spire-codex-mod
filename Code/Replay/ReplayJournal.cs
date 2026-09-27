@@ -286,6 +286,11 @@ internal sealed class ReplayJournal : IDisposable
                 foreach (var item in ints) w.WriteNumberValue(item);
                 w.WriteEndArray();
                 break;
+            case ReplayLine nested: // a single nested object (rng_state)
+                w.WriteStartObject(key);
+                foreach (var (k, v) in nested.Fields) WriteField(w, k, v);
+                w.WriteEndObject();
+                break;
             case IEnumerable<ReplayLine> rows: // nested option/entity rows
                 w.WriteStartArray(key);
                 foreach (var row in rows)

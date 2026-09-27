@@ -635,6 +635,14 @@ internal static class ReplayHooks
             line.Set("combat_id", _combatId)
                 .Set("attempt_id", ReplayRecorder.AttemptId)
                 .Set("encounter", encounter)
+                // The run's position in every random stream, at a precisely defined instant.
+                // This is a Harmony PREFIX on Hook.BeforeCombatStart, which CombatManager calls
+                // after the encounter's creatures are added and before StartTurn -- so the
+                // counters are stamped before turn 1's shuffle and deal, and before any relic's
+                // own BeforeCombatStart (Snecko Eye, Byrdpip) has drawn. A fight can therefore
+                // be graded from its stated position rather than from a position inferred by
+                // replaying every fight before it.
+                .Set("rng_state", RngState.Read())
                 .Set("enemies", enemies)
                 .Emit();
         }
