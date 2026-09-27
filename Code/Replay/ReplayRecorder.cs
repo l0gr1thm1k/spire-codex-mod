@@ -318,15 +318,20 @@ public static class ReplayRecorder
             //    deck_select_enchant as a decision_type. Enchantment had no witness of any
             //    kind before this, so a 4 reader cannot tell an enchanted deck from a plain
             //    one; everything here is additive and a 4 reader is otherwise unaffected.
+            // 6  adds rng_state (the draw counter for each RNG stream, on header, resume,
+            //    combat_start and the in-process remap), cid on the combat_start enemy rows
+            //    plus target_cid, src_cid, dst_cid and tgt_cid on the rows that name a
+            //    creature, and the relic_lost line. This one needs the bump where the deck
+            //    row fields did not: `up` is written even at 0, so a deck row either carries
+            //    it or the capture predates it, while an rng_state stream that cannot be read
+            //    is omitted and a cid that cannot be resolved is absent. Without a version to
+            //    branch on, "this mod version did not record it" and "this run could not read
+            //    it" are the same missing field.
             //
-            // Still 5 with up/enchantment/amount on deck rows, deliberately. The backend
-            // rejects a replay_version it has not shipped (400 bad_header against
-            // KNOWN_REPLAY_VERSIONS), so bumping ahead of a deploy makes every upload fail,
-            // and these fields need no version to be read: `up` is emitted even at 0, so deck
-            // rows either all carry it or none do, and its absence dates the capture exactly
-            // the way a bump would. Fold the bump into the next change that genuinely needs
-            // one.
-            ?.Set("replay_version", 5)
+            // The backend rejects a replay_version it has not shipped (400 bad_header against
+            // KNOWN_REPLAY_VERSIONS), and on that path the mod marks the journal sent, so the
+            // allowlist has to accept 6 before this ships.
+            ?.Set("replay_version", 6)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
             // The .run records the bare version ("v0.111.0"); Sts2Version.Current carries the
