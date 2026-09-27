@@ -367,6 +367,15 @@ internal static class ReplayHooks
         // Relics, potions, events, rest.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
                                  "Obtain", me, nameof(RelicObtained), 3);
+        // Departures. Postfix, so the row is written against a removal that already happened:
+        // Remove() does its work before its first await, so by the time the postfix runs the
+        // relic is out of the player's list.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
+                                 "Remove", me, nameof(RelicRemoved), 1, postfix: true);
+        // Replace() calls Remove() then Obtain(), so it needs no emitter of its own -- only a
+        // marker, so the pair it produces is readable as one swap rather than two coincidences.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
+                                 "Replace", me, nameof(RelicReplacing), 2);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionUsed", me, nameof(PotionUsed));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionProcured", me, nameof(PotionProcured));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionDiscarded", me, nameof(PotionDiscarded));
@@ -1580,6 +1589,63 @@ internal static class ReplayHooks
             ReplayRecorder.Line("relic")
                 ?.Set("decision_id", !fromShelf && _decision > 0 ? _decision : (int?)null)
                 .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // RelicCmd.Replace(original, replace) prefix. Replace is Remove-then-Obtain, so the only
+    // thing the nested Remove cannot work out for itself is WHY it was called. Same idiom as
+    // _pendingBuyKind, which exists so a relic arriving mid-purchase knows it came off a shelf.
+    private static bool _replacingRelic;
+
+    private static void RelicReplacing() => _replacingRelic = true;
+
+    // RelicCmd.Remove(RelicModel relic) postfix. The journal recorded every relic gained and
+    // none lost, so a run that handed one to Ranwid the Elder read as still holding it for the
+    // rest of the run -- and a relic that changes what every fight does (Red Mask putting Weak
+    // on every enemy at the top of every turn) went on doing it in the model for 28 more floors.
+    //
+    // The only witness before this was the event outcome's display LABEL ("Give Red Mask"),
+    // which is localized, and which in 2 of 6 real cases was the unsubstituted template
+    // "Give {Relic}" -- unreadable in any language.
+    //
+    // Owner survives this point: RemoveRelicInternal -> RelicModel.RemoveInternal() only sets
+    // HasBeenRemovedFromState, so the co-op owner check below still resolves.
+    //
+    // The HasBeenRemovedFromState guard is doing real work, not belt-and-braces. Remove() is an
+    // `async Task`, so a throw inside it is captured on the returned Task instead of
+    // propagating, and a postfix therefore runs even when the removal FAILED --
+    // RemoveRelicInternal throws when the player does not hold the relic. The flag is set by the
+    // removal itself, so it is the one thing on hand that tells the two apart. Without it this
+    // hook would happily record relics that never left.
+    //
+    // Not covered, deliberately: RelicCmd.Melt (ToyBox). A melted relic STAYS in the inventory
+    // and stops working, which is a state change and not a departure; filing it under a "lost"
+    // row would tell a consumer the wrong thing. It needs its own answer.
+    private static void RelicRemoved(object __0)
+    {
+        try
+        {
+            var replacing = _replacingRelic;
+            _replacingRelic = false;
+            if (Reflect.GetMember(__0, "HasBeenRemovedFromState") is not true) return;
+            ReplayRecorder.Line("relic_lost")
+                // Only an event may own a removal. Measured against the game's callers:
+                // RanwidTheElder and RelicTrader go through an event decision, while
+                // SwordOfStone and TouchOfOrobas reach Remove via Replace with no decision open
+                // at all, and the dev console has none either. Without the gate those three
+                // would inherit whichever screen happened to be open, which is the same
+                // mis-join a shop relic used to make.
+                ?.Set("decision_id",
+                      !replacing && _decisionType == "event" && _decision > 0
+                          ? _decision : (int?)null)
+                .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                // "replaced" pairs this with the `relic` row that follows it from the same
+                // swap. Stated rather than left to be inferred from adjacency, which is only
+                // ever a guess about ordering.
+                .Set("reason", replacing ? "replaced" : "removed")
+                .Set("mine", Mine(Reflect.GetMember(__0, "Owner")))
                 .Emit();
         }
         catch { }
