@@ -74,6 +74,7 @@ internal sealed class ReplayJournal : IDisposable
     // an id the earlier session already used. See ReplayJournalScan.HighWaterOf.
     public int LastCardId { get; }
     public int LastDecisionId { get; }
+    public int LastCreatureId { get; }
 
     // The last full deck listing already in the file, raw. Null on a new run. The recorder
     // aligns the resumed deck against it to bridge instance ids across the reload.
@@ -95,6 +96,7 @@ internal sealed class ReplayJournal : IDisposable
         _seq = prior.Seq + 1;
         LastCardId = prior.Card;
         LastDecisionId = prior.Decision;
+        LastCreatureId = prior.Creature;
         DeckLine = prior.DeckLine;
         _channel = Channel.CreateBounded<ReplayLine>(new BoundedChannelOptions(QueueCapacity)
         {

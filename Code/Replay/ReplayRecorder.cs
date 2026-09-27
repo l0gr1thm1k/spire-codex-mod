@@ -197,6 +197,7 @@ public static class ReplayRecorder
             // the deck, and on a resume that is the whole current deck.
             CardInstances.ResumeFrom(journal.LastCardId);
             Interlocked.Exchange(ref _decisionId, journal.LastDecisionId);
+            CreatureSlots.ResumeFrom(journal.LastCreatureId);
 
             lock (Gate) _journal = journal;
             WriteHeader(snapshot, runSeed, startTime);

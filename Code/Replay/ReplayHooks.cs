@@ -550,6 +550,10 @@ internal static class ReplayHooks
                 .Where(x => x != null).ToList();
             ReplayRecorder.Line("move")
                 ?.Set("src", CreatureRef(owner))
+                // Which enemy is about to act. In a fight with two of the same monster the two
+                // intent lines were indistinguishable, so the move could not be attributed to
+                // the body that then dealt the damage.
+                .Set("src_cid", CreatureSlots.Maybe(owner))
                 .Set("id", Reflect.GetString(__instance, "StateId"))
                 .Set("intents", intents.Count > 0 ? intents : null)
                 .Emit();
@@ -627,8 +631,19 @@ internal static class ReplayHooks
             foreach (var e in Enumerate(Reflect.GetMember(__1, "Enemies")))
             {
                 enemies.Add(new ReplayLine("e")
+                    // `i` keeps the meaning it has always had: this enemy's POSITION in the list,
+                    // 0..n-1, left to right. Unchanged, because released readers already parse it.
                     .Set("i", i++)
+                    // `cid` is the body's identity, and is what every `*_cid` elsewhere refers to.
+                    // Deliberately not the same thing as `i`: position is per fight and shifts as
+                    // enemies die, identity is per run and never moves.
+                    .Set("cid", CreatureSlots.Maybe(e))
                     .Set("id", Ids.Bare(Reflect.GetString(e, "ModelId")))
+                    // The game's OWN name for this position, when the encounter defines one (only
+                    // 19 of 98 do). Absent everywhere else, so it cannot serve as the identity --
+                    // but where present it ties `cid` to what the player sees on screen, and is
+                    // how a consumer can check the two agree.
+                    .Set("slot", Reflect.GetString(e, "SlotName"))
                     .Set("hp", Reflect.GetInt(e, "CurrentHp", 0))
                     .Set("max_hp", Reflect.GetInt(e, "MaxHp", 0)));
             }
@@ -752,10 +767,13 @@ internal static class ReplayHooks
                 .Set("deck_c", origin > 0 ? origin : (int?)null)
                 .Set("id", Ids.Bare(Reflect.GetString(card, "Id")))
                 .Set("up", Reflect.GetInt(card, "CurrentUpgradeLevel", 0))
-                // Model id only. Minting a CardInstances id for a Creature would consume ids
-                // from the card sequence and corrupt card_instances downstream, so two
-                // identical enemies are deliberately not distinguished here.
+                // Model id AND slot. The id alone names a species, so against two Corpse Slugs
+                // every targeted play read CORPSE_SLUG and which one took it was unrecoverable.
+                // The old objection here -- that minting a CardInstances id for a Creature would
+                // consume ids from the card sequence and corrupt card_instances downstream --
+                // is answered by CreatureSlots keeping a sequence of its own.
                 .Set("target", target == null ? null : Ids.Bare(Reflect.GetString(target, "ModelId")))
+                .Set("target_cid", CreatureSlots.Maybe(target))
                 .Set("cost_paid", Reflect.GetInt(resources, "EnergySpent", -1))
                 .Set("stars_paid", Reflect.GetInt(resources, "StarsSpent", 0))
                 .SetFlag("auto", Reflect.GetBool(__1, "IsAutoPlay"))
@@ -843,7 +861,11 @@ internal static class ReplayHooks
                 // read. Naming it keeps that distinguishable from a failed reflection.
                 ?.Set("src", dealerIsPlayer ? "player"
                         : __2 == null ? "effect" : Ids.Bare(Reflect.GetString(__2, "ModelId")))
+                .Set("src_cid", CreatureSlots.Maybe(__2))
                 .Set("dst", targetIsPlayer ? "player" : Ids.Bare(Reflect.GetString(__5, "ModelId")))
+                // Which body took it. Without this, two of the same enemy share one `dst` and
+                // the kill order in a multi-enemy fight is not recoverable from the journal.
+                .Set("dst_cid", CreatureSlots.Maybe(__5))
                 .Set("dmg", Reflect.GetInt(__3, "UnblockedDamage", 0))
                 .Set("blocked", Reflect.GetInt(__3, "BlockedDamage", 0))
                 .SetFlag("killed", Reflect.GetBool(__3, "WasTargetKilled"))
@@ -875,14 +897,19 @@ internal static class ReplayHooks
     {
         try
         {
+            var owner = Reflect.GetMember(__2, "Owner");
             ReplayRecorder.Line("power")
                 // Who applied it. Without this a relic or thorns ticking on the enemy turn
                 // looked identical to a monster buffing itself, because tgt was the only clue.
                 // Same convention as hit.src: a null applier is an effect, not a failed read.
                 ?.Set("src", CreatureRef(__4))
+                .Set("src_cid", CreatureSlots.Maybe(__4))
                 .Set("id", Ids.Bare(Reflect.GetString(__2, "Id")))
                 .Set("n", (int)__3)
-                .Set("tgt", Ids.Bare(Reflect.GetString(Reflect.GetMember(__2, "Owner"), "ModelId")))
+                .Set("tgt", Ids.Bare(Reflect.GetString(owner, "ModelId")))
+                // Which body carries the debuff. `tgt` alone said CORPSE_SLUG for a Weak that
+                // only one of the two slugs actually had.
+                .Set("tgt_cid", CreatureSlots.Maybe(owner))
                 .Emit();
         }
         catch { }
@@ -918,6 +945,7 @@ internal static class ReplayHooks
             // journal at all and the turn read as "nothing recorded".
             ReplayRecorder.Line("block")
                 ?.Set("src", CreatureRef(__1))
+                .Set("src_cid", CreatureSlots.Maybe(__1))
                 .Set("n", (int)__2)
                 .Set("card", __4 == null ? null : Ids.Bare(Reflect.GetString(__4, "Id")))
                 .Emit();

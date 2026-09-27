@@ -60,11 +60,12 @@ public static class ReplayJournalScan
     // journal open, on the run-start path, against a file that reaches ~1.5 MB at the extreme.
     public readonly struct HighWater
     {
-        public HighWater(long seq, int card, int decision, string? deckLine)
+        public HighWater(long seq, int card, int decision, int creature, string? deckLine)
         {
             Seq = seq;
             Card = card;
             Decision = decision;
+            Creature = creature;
             DeckLine = deckLine;
         }
 
@@ -72,6 +73,11 @@ public static class ReplayJournalScan
         public long Seq { get; }
         public int Card { get; }
         public int Decision { get; }
+
+        // Creature ids have the same property as the two above and needed the same treatment:
+        // a body's id must name one body for the whole journal, and a second session that
+        // restarts at 1 makes the first fight's enemy and the eighth fight's enemy share it.
+        public int Creature { get; }
 
         // The raw text of the last line in the file that listed the whole deck, or null when
         // there is none. Kept as text and parsed only if it is needed, so the common case (a
@@ -84,10 +90,11 @@ public static class ReplayJournalScan
         var seq = -1L;
         var card = 0L;
         var decision = 0L;
+        var creature = 0L;
         string? deckLine = null;
         try
         {
-            if (!File.Exists(path)) return new HighWater(-1, 0, 0, null);
+            if (!File.Exists(path)) return new HighWater(-1, 0, 0, 0, null);
             using var stream = new FileStream(
                 path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = new StreamReader(stream);
@@ -103,6 +110,13 @@ public static class ReplayJournalScan
                 card = MaxField(line, "to_c", card);
                 card = MaxField(line, "instance_id", card);
                 decision = MaxField(line, "decision_id", decision);
+                // Every key that carries a creature id. The needle includes the leading quote,
+                // so "cid" cannot also match "target_cid" and each has to be named.
+                creature = MaxField(line, "cid", creature);
+                creature = MaxField(line, "target_cid", creature);
+                creature = MaxField(line, "src_cid", creature);
+                creature = MaxField(line, "dst_cid", creature);
+                creature = MaxField(line, "tgt_cid", creature);
                 // The newest full deck listing wins, whichever kind wrote it: a `deck` row from
                 // mid-session, or the `starting_deck` on a header. Cheap substring tests, so the
                 // scan stays one pass and allocates nothing per line.
@@ -116,7 +130,7 @@ public static class ReplayJournalScan
             // A truncated or unreadable tail still leaves everything read so far usable, and a
             // high-water mark that is too LOW is the pre-existing behaviour, not a regression.
         }
-        return new HighWater(seq, (int)card, (int)decision, deckLine);
+        return new HighWater(seq, (int)card, (int)decision, (int)creature, deckLine);
     }
 
     // Highest value of "<key>":<integer> anywhere in the line, or `best` when the key is absent.
