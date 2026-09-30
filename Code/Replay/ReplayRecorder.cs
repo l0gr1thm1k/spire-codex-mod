@@ -9,55 +9,20 @@ using SpireCodex.Producer;
 
 namespace SpireCodex.Replay;
 
-// Run lifecycle for the replay journal: opens one per run, stamps the header, hands out
-// decision ids, and closes it with a terminal line. The hooks in ReplayHooks call Line() to
-// emit; this class owns everything about which file is open and when.
-//
-// Run boundaries come from the producer tick reporting the live seed, the same signal
-// DamageTracker.NoteRun already uses, so there is no need to reach into game types for a
-// "run started" event that may not exist.
-//
-// Phase 1 records to disk only. Upload lands in phase 3 and reads the same files.
 public static class ReplayRecorder
 {
     private static ReplayJournal? _journal;
     private static string? _seed;
-    // Last snapshot seen while still in the run. By the time the seed clears the run is
-    // already gone, so the outcome has to be remembered rather than read at close time.
     private static Snapshot? _lastInRun;
-    // Deck instance ids for the terminal line, captured while the run is still live (the live
-    // player is gone by the time it ends).
-    //
-    // Refreshed on a MEMBERSHIP signature, not on deck size. Size was wrong: CardCmd.Transform
-    // swaps one card for another without changing the count, so a transformed deck kept the
-    // stale list and final_deck claimed the transformed-away instance survived while omitting
-    // its replacement. A removal plus an acquisition between two ticks had the same problem.
     private static List<ReplayLine>? _deckSnapshot;
     private static int _deckCount = -1;
     private static int _deckSig;
-    // Set by the hooks that change a card's STATE without changing deck membership. The
-    // snapshot signature cannot see those: DeckEntry carries Upgraded as a bool while the
-    // listing writes CurrentUpgradeLevel as an int, so a second upgrade on one card moves
-    // nothing, and a stackable enchantment raising `amount` keeps the same enchantment id.
-    // Either way the listing would keep reporting the earlier state as current.
     private static volatile bool _deckDirty;
-    // The keyed form of whatever _deckSnapshot last held. Kept so an in-process reload can be
-    // aligned against the listing that preceded it with no file read at all.
     private static List<DeckRemap.Entry>? _deckKeys;
-    // The first card OBJECT of the listing above. A reload replaces every CardModel, so this
-    // reference going stale is the signal; see DeckWasRenumbered for why identity beats asking
-    // CardInstances whether the card is known.
     private static WeakReference<object>? _deckFirst;
 
-    // Signature of the merchant stock last written, so a shop line is emitted when the screen
-    // opens and again whenever the stock actually changes (a purchase, a restock, a price
-    // move) rather than on every 10 Hz tick. Cleared on leaving the shop so revisiting emits.
     private static string? _shopSig;
 
-    // Authoritative floor, latched by the room hook from the live run state. The snapshot's
-    // floor lags by up to one 10 Hz tick, which is invisible mid-floor but wrong for the first
-    // lines after entering a room: combat_start fires immediately after AfterRoomEntered and
-    // was being stamped with the PREVIOUS floor, so a fight filed one floor too early.
     private static int _floor = -1;
     private static int _act = -1;
 
@@ -69,29 +34,20 @@ public static class ReplayRecorder
     private static int _decisionId;
     private static readonly object Gate = new();
 
-    // %APPDATA%/SpireCodex/replays/. Deliberately NOT inside the game's save tree: the
-    // game's cloud sync deletes local-only files it doesn't recognise, which already bit us
-    // on the modded/vanilla save split. This sits next to the upload ledger and the backfill
-    // marker, which live here for the same reason.
     public static string Dir { get; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "SpireCodex", "replays");
 
     public static bool Active => _journal != null;
 
-    // Path of the journal being written right now, so the upload sweep skips it.
     public static string? CurrentPath => _journal?.Path;
 
-    // Called once at mod init. Recovers journals abandoned by a crash before any new run can
-    // open one.
     public static void Start()
     {
         try
         {
             Directory.CreateDirectory(Dir);
             RecoverAbandoned();
-            // After recovery, never before: a journal gets its terminal line first, so an
-            // interrupted one is a complete record by the time retention looks at it.
             ReplayUploader.PruneOld();
         }
         catch (Exception e)
@@ -100,8 +56,6 @@ public static class ReplayRecorder
         }
     }
 
-    // Producer tick. Opens a journal when a new run begins and closes one when the run ends.
-    // No-op unless the seed changed, so this is cheap to call at 10 Hz.
     public static void NoteRun(Snapshot snapshot)
     {
         try
@@ -111,25 +65,15 @@ public static class ReplayRecorder
             var seed = snapshot.InRun ? snapshot.Seed : null;
             if (seed == _seed)
             {
-                // Same run: keep the outcome state fresh for the eventual terminal line.
                 if (snapshot.InRun)
                 {
                     _lastInRun = snapshot;
                     RefreshDeckIfChanged(snapshot);
-                    // This call was missing entirely. RecordShopIfChanged existed, was correct,
-                    // and was never invoked, so not one `shop` line was written in any journal
-                    // ever recorded while 44 `buy` lines were. C# does not warn on an unused
-                    // private static method, and the deck refresh right above it made the block
-                    // look complete. Second time this exact shape has bitten this feature.
                     RecordShopIfChanged(snapshot);
                 }
                 return;
             }
 
-            // The run changed. Close the OLD one with the last state seen IN IT, before any
-            // run-scoped cache is touched. The earlier version assigned _lastInRun from the new
-            // snapshot before this comparison, so a direct run-A-to-run-B transition (no
-            // out-of-run tick between) closed A carrying B's hp, floors, runtime and relics.
             if (_journal != null)
             {
                 var prior = _lastInRun;
@@ -160,22 +104,11 @@ public static class ReplayRecorder
             _deckSig = 0;
             _deckDirty = false;
 
-            // Identity must match the .run EXACTLY. The upload endpoint 409s on a header whose
-            // seed / start_time / character disagree with the run doc, and both were wrong:
-            //   seed       — Snapshot.Seed is Rng.Seed, the NUMERIC rng seed
-            //                (15804765326433090030); the .run stores Rng.StringSeed, the
-            //                display seed (JLUJ75JXPV9F). Completely different values.
-            //   start_time — was DateTimeOffset.UtcNow at journal open, which ran a second
-            //                after the run actually started (1788584350 vs 1788584349).
-            // Every replay upload would have been rejected.
             var runState = Core.Sts2Access.LiveRunState;
             var runSeed = Reflect.GetString(Reflect.GetMember(runState, "Rng"), "StringSeed");
             var startTime = RunStartTime();
             if (runSeed == null || startTime == 0)
             {
-                // Loud, not silent. A wrong identity here does not break the recording, it
-                // makes every upload 409 header_mismatch forever, and the first version of
-                // this failed exactly that way while looking fine on disk.
                 MainFile.Logger.Info(
                     $"replay: RUN IDENTITY INCOMPLETE (seed={runSeed ?? "?"}, start_time={startTime}); "
                     + "uploads will be rejected until this is fixed");
@@ -186,15 +119,6 @@ public static class ReplayRecorder
             var journal = ReplayJournal.Open(Dir, runSeed, startTime);
             if (journal == null) return;
 
-            // Pick the id counters back up where the previous session of this run left them.
-            // The resets above are correct for a genuinely new run and wrong for a reload: the
-            // journal filename is derived from seed + start_time, so a reload APPENDS to a file
-            // that already contains card ids 1..N and decision ids 1..M, and restarting at 0
-            // reissues every one of them to different things. Both marks come from the single
-            // scan ReplayJournal already ran to resume `s`, so this costs no extra file read.
-            //
-            // Must happen before WriteHeader: its starting_deck mints an id for every card in
-            // the deck, and on a resume that is the whole current deck.
             CardInstances.ResumeFrom(journal.LastCardId);
             Interlocked.Exchange(ref _decisionId, journal.LastDecisionId);
             CreatureSlots.ResumeFrom(journal.LastCreatureId);
@@ -202,47 +126,23 @@ public static class ReplayRecorder
             lock (Gate) _journal = journal;
             WriteHeader(snapshot, runSeed, startTime);
 
-            // A run loaded from a save continues the SAME journal (seed and start_time are
-            // restored, so the filename matches and the writer appends). That continuity is
-            // what makes the reload invisible otherwise: the run clock does not jump, and a
-            // replayed turn just looks like more play. The game counts reloads itself —
-            // SaveManager.IncrementNumReloads fires on load — so this is measured, not inferred.
             var reloads = Reloads();
             AttemptId = reloads;
-            // Latch the position from the snapshot we were HANDED rather than leaving Line() to
-            // fall back to LiveStateProducer.Latest, which is the same producer that is mid-call
-            // into us and may not have published yet. The resume line's floor is what tells a
-            // consumer which fight the reload rolled back, so it must not be a null that looks
-            // like "no floor".
             NoteFloor(snapshot.TotalFloor, snapshot.Act);
-            // If the reload landed us inside a fight, re-latch that fight's id BEFORE the resume
-            // line, so the resume itself names the combat it resumed into and every turn, play
-            // and hp line after it is attributable.
             var resumedCombat = ReplayHooks.ResumeCombatIfInFight();
-            // journal.Resumed, not reloads: the game's counter does not move on an in-process
-            // quit-to-menu and Continue, and that boundary still needs marking.
             if (journal.Resumed || reloads > 0)
                 Line("resume")
                     ?.Set("reloads", reloads)
-                    // Present only when the reload dropped straight back into an unfinished
-                    // fight. Absent means the reload landed out of combat, which is the case
-                    // where the earlier attempt really was rolled back.
                     .Set("combat_id", resumedCombat)
                     .Set("wall_clock", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                     .Set("run_time", snapshot.RunTime)
                     .Set("hp", snapshot.CurrentHp)
                     .Set("gold", snapshot.Gold)
                     .Set("deck_size", snapshot.DeckSize)
-                    // The restored position, which is the one thing a reload changes that
-                    // nothing else in the stream records. Counters go BACKWARDS here whenever
-                    // the save predates the abandoned attempt, and that rollback is invisible
-                    // otherwise -- a consumer carrying position forward across a resume would
-                    // be wrong by exactly the draws the rolled-back play made.
                     .Set("rng_state", RngState.Read())
                     .Emit();
-            // Bridge instance ids across the reload before anything else references them.
             if (journal.Resumed) EmitDeckRemap(journal);
-            RefreshDeckIfChanged(snapshot); // so an early finish still has instance-level deck
+            RefreshDeckIfChanged(snapshot);
             MainFile.Logger.Info($"replay: recording {Path.GetFileName(journal.Path)}");
         }
         catch (Exception e)
@@ -251,135 +151,52 @@ public static class ReplayRecorder
         }
     }
 
-    // Emit a line. Returns null when nothing is recording, so hooks read as:
-    //     ReplayRecorder.Line("play")?.Set("id", id).Emit();
-    // and cost nothing outside a recorded run.
-    //
-    // floor and act are stamped centrally from the live snapshot rather than re-derived by
-    // each hook: the producer already tracks them, and the analytics tables need them on
-    // every row so month partitions prune without joining back to the run.
     public static ReplayLine? Line(string kind)
     {
         if (_journal == null) return null;
         var line = new ReplayLine(kind);
-        // Prefer the floor the room hook latched; fall back to the snapshot before the first
-        // room of a run has been entered.
         if (_floor >= 0) line.Set("floor", _floor).Set("act", _act > 0 ? _act : 1);
         else if (LiveStateProducer.Latest is { InRun: true } s)
             line.Set("floor", s.TotalFloor).Set("act", s.Act);
         return line;
     }
 
-    // Companion to Line(): pushes the built line into the open journal.
     public static void Emit(this ReplayLine? line)
     {
         if (line == null) return;
         _journal?.Write(line);
     }
 
-    // A fresh decision id. One per choice-set observation (a card reward, a shop visit, a
-    // removal, an event page), carried on the offer, on every option row, and on the
-    // resolution lines, so a late-arriving resolution still joins to its decision instead of
-    // being inferred from adjacency.
     public static int NextDecisionId() => Interlocked.Increment(ref _decisionId);
 
-    // Which play session of this run is writing. A resumed run appends to the same journal, so
-    // "same combat_id, different attempt_id" is how a consumer tells a fight that was restarted
-    // by a reload from one that simply continued.
-    //
-    // It reads the GAME's reload counter rather than counting journal opens ourselves. Counting
-    // opens would restart at 0 whenever a journal is recreated, and the whole point of the field
-    // is that it stays meaningful across exactly the event that clears our in-memory state.
     public static int AttemptId { get; private set; }
 
-    // "{act}.{floor}" from the latched position, the same values Line() stamps. Used to build a
-    // combat id that survives a reload, so it must come from the run's own coordinates and not
-    // from any counter this process keeps.
     public static string FloorKey => $"{(_act > 0 ? _act : 1)}.{(_floor >= 0 ? _floor : 0)}";
 
     private static void WriteHeader(Snapshot s, string seed, long startTime)
     {
         Line("header")
-            // 1  the original schema.
-            // 2  adds combat_id + attempt_id on combat lines, combat_end.hp_lost_total, and
-            //    selected_option_indices on a deck-select outcome. Also the first version in
-            //    which room.coord is reliably populated: it existed in 1 and was always null,
-            //    so a consumer must branch on THIS number rather than on whether a coord
-            //    happens to be present. "this mod version did not record map positions" and
-            //    "this floor's position was not recorded" are different sentences.
-            // 4  adds starting_max_hp and starting_hp to the header, so the ascension HP
-            //    penalty is readable without inferring it from the run-start heal.
-            // 3  adds the move line (what an enemy actually did), src on power and block, block
-            //    for monsters as well as the player, and an hp line on heals so a rest site
-            //    records the amount rather than only the option taken.
-            // 5  adds the pick line (the cards a selection screen returned, for every screen
-            //    rather than only deck removal) and the enchant line (which card an
-            //    enchantment landed on, how much, and the pile it was in), plus
-            //    deck_select_enchant as a decision_type. Enchantment had no witness of any
-            //    kind before this, so a 4 reader cannot tell an enchanted deck from a plain
-            //    one; everything here is additive and a 4 reader is otherwise unaffected.
-            // 6  adds rng_state (the draw counter for each RNG stream, on header, resume,
-            //    combat_start and the in-process remap), cid on the combat_start enemy rows
-            //    plus target_cid, src_cid, dst_cid and tgt_cid on the rows that name a
-            //    creature, and the relic_lost line. This one needs the bump where the deck
-            //    row fields did not: `up` is written even at 0, so a deck row either carries
-            //    it or the capture predates it, while an rng_state stream that cannot be read
-            //    is omitted and a cid that cannot be resolved is absent. Without a version to
-            //    branch on, "this mod version did not record it" and "this run could not read
-            //    it" are the same missing field.
-            //
-            // The backend rejects a replay_version it has not shipped (400 bad_header against
-            // KNOWN_REPLAY_VERSIONS), and on that path the mod marks the journal sent, so the
-            // allowlist has to accept 6 before this ships.
-            ?.Set("replay_version", 6)
+            ?.Set("replay_version", 7)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
-            // The .run records the bare version ("v0.111.0"); Sts2Version.Current carries the
-            // commit too ("v0.111.0+41cef1ea"). The run corpus partitions on build_id, so the
-            // header has to use the same form or replays never join their runs by build. The
-            // precise value is kept alongside rather than thrown away.
             .Set("build_id", Core.Sts2Version.Current.Split('+')[0])
             .Set("build_id_full", Core.Sts2Version.Current)
             .Set("mod_version", Api.ModVersion.Current)
             .Set("character", s.Character)
             .Set("ascension", s.Ascension)
-            // Max HP before anything in the run moves it, which is the denominator for the
-            // Ascension 2 effect. "Weary Traveler: Ancients only heal 80% of your missing HP",
-            // and a run begins at 0 HP, so the Neow heal lands at 80% of max from A2 up and
-            // 100% below it. Measured across real runs: A0 and A1 heal to full, A3, A5 and A10
-            // all heal to exactly 80%, on both Ironclad (64 of 80) and Regent (60 of 75). The
-            // penalty does not deepen past A2.
-            //
-            // end.max_hp cannot serve: by then Cook, Stone Humidifier and anything else that
-            // raises the cap have moved it. This is the value before any of that.
             .Set("starting_max_hp", s.MaxHp > 0 ? s.MaxHp : (int?)null)
-            // No starting_hp field on purpose. The snapshot reports the character's DEFAULT at
-            // header time, before the run's real state exists, so it came back 80 on a run that
-            // actually began at 0 and was healed to 64. A confidently wrong number is worse than
-            // none. Real starting HP is the first hp line, src "heal", at floor 0.
             .Set("game_mode", s.GameMode?.ToLowerInvariant())
             .Set("modifiers", s.Modifiers)
             .Set("start_time", startTime)
             .Set("platform_type", "steam")
             .Set("player_count", s.PlayerCount)
             .Set("reloads", Reloads())
-            // Real instance ids for the starting deck, so lineage is exact instead of inferred.
-            // Without this a consumer has to guess that "any id first seen outside an acquire is
-            // a starter", which misfires on cards generated mid-combat (Slimed, Guilty, and
-            // every Ascender's Bane) — all of which first appear in a draw line.
             .Set("starting_deck", StartingDeck())
             .Set("starting_relics", s.Relics.Select(r => r.Id).ToList())
-            // The run's origin in every random stream. On a genuinely new run these are all 0
-            // and the field says so explicitly rather than leaving a consumer to assume it; on
-            // a resume the header is rewritten mid-run, so they are wherever that session
-            // reopened, which is the anchor for everything before the first combat_start.
             .Set("rng_state", RngState.Read())
             .Emit();
     }
 
-    // How many times this run has been loaded from a save. The game maintains the counter
-    // (RunManager._numReloads, restored from the save and incremented on every load), so a
-    // quit-and-reload is detectable exactly rather than guessed from timing.
     private static int Reloads()
     {
         try
@@ -394,17 +211,12 @@ public static class ReplayRecorder
         return 0;
     }
 
-    // What the merchant had on offer. Emitted from the snapshot rather than a game hook: the
-    // live feed already parses the whole inventory (RoomExport.ReadShop), including sold-out
-    // slots, sale flags and the removal price, and the stock is only knowable once the screen
-    // has populated. Without this a merchant floor records only what was bought, so everything
-    // the player passed over — the actual alternatives — is unrecoverable.
     private static void RecordShopIfChanged(Snapshot s)
     {
         if (_journal == null) return;
         if (s.Shop is not { } shop)
         {
-            _shopSig = null; // left the merchant; a later visit is a fresh stock
+            _shopSig = null;
             return;
         }
 
@@ -423,17 +235,10 @@ public static class ReplayRecorder
                 .Set("cost", it.Cost)
                 .SetFlag("stocked", it.Stocked)
                 .SetFlag("sale", it.OnSale)
-                .Set("pool", it.Slot))   // "character" / "colorless" for cards
+                .Set("pool", it.Slot))
             .ToList();
 
         Line("shop")
-            // Stamp position from the snapshot that DETECTED the shop, overriding the latch.
-            // Line() prefers the floor the room hook latched, and this runs off the producer
-            // tick, which beats the room hook by one beat on entry. So the first shop line of a
-            // visit, the one carrying the full pre-purchase stock and the only one that is an
-            // offer set, was stamped with the PREVIOUS floor: 3 while the merchant was floor 4.
-            // Every later line for that same visit had the right floor, so a consumer grouping
-            // by floor lost exactly the line worth having.
             ?.Set("floor", s.TotalFloor)
             .Set("act", s.Act)
             .Set("gold", s.Gold)
@@ -445,10 +250,6 @@ public static class ReplayRecorder
             .Emit();
     }
 
-    // The run's own start time, which the .run serialises as start_time and the upload endpoint
-    // matches on. It lives on RunManager as the private _startTime, not on RunState: reading
-    // "StartTime" off the run state returned null and silently fell back to the wall clock,
-    // which is how the header ended up one second later than the .run.
     private static long RunStartTime()
     {
         try
@@ -464,21 +265,12 @@ public static class ReplayRecorder
         return 0;
     }
 
-    // State which pre-reload instance id each resumed card continues, where that is knowable.
-    //
-    // Emitted rather than left to consumers because the mod is the only party that ever holds
-    // both numberings, and because a consumer guessing at it by name is exactly the wrong
-    // outcome: four Defends make the guess a coin flip, and a wrong lineage is worse than a
-    // missing one. `ambiguous` is the count it refused to assert, so silence here is
-    // distinguishable from "nothing moved".
     private static void EmitDeckRemap(ReplayJournal journal)
     {
         try
         {
             var before = ReplayJournalScan.DeckEntries(journal.DeckLine);
             if (before.Count == 0) return;
-            // Re-reading the deck is safe and cheap: WriteHeader already minted these ids and
-            // CardInstances.Of is idempotent, so this returns the same numbering it wrote.
             LiveDeck(out var after);
             if (after.Count == 0) return;
 
@@ -492,29 +284,12 @@ public static class ReplayRecorder
             Line("remap")
                 ?.Set("cards", rows.Count > 0 ? rows : null)
                 .Set("ambiguous", result.Ambiguous > 0 ? result.Ambiguous : (int?)null)
-                // Always present, true or false: "the two listings matched position for
-                // position" and "we could not tell" are different claims, and an absent flag
-                // would read as the weaker one.
                 .SetFlag("exact", result.Exact)
                 .Emit();
         }
         catch { }
     }
 
-    // Re-capture the deck when it changes, and write the new listing out.
-    //
-    // The signature folds every card id IN ORDER, so a transform (same count, different card)
-    // is caught as well as an add or remove. It also folds upgrade level and enchantment,
-    // which it did not before: those do not change a card's id, so upgrading a card left the
-    // signature identical, the snapshot unrefreshed, and `final_deck` reporting the upgrade
-    // state from whenever deck membership last moved. Harmless while the listing carried only
-    // {c, id}; a stale wrong value the moment it started carrying `up`.
-    //
-    // The listing is EMITTED now rather than only held for final_deck. Two reasons: a deck
-    // timeline is what a consumer needs to know when a card was upgraded without replaying
-    // every row, and — the load-bearing one — a reload can only be bridged against a listing
-    // that is recent. Held in memory it dies with the process; the newest listing before a
-    // reload was otherwise the previous header's, which is stale by a whole session.
     private static void RefreshDeckIfChanged(Snapshot s)
     {
         if (_journal == null) return;
@@ -534,25 +309,6 @@ public static class ReplayRecorder
         Line("deck")?.Set("cards", _deckSnapshot).Emit();
     }
 
-    // An in-process reload: quit to the menu and Continue, or load a save, without the process
-    // ever dying.
-    //
-    // This is the common reload and NOTHING saw it. The journal only reopens when the seed
-    // changes, so no header, no resume marker and no remap were written; meanwhile the game
-    // rebuilt every CardModel from the save, CardInstances minted a fresh id for each, and the
-    // deck silently renumbered mid-file. Measured on a real 47-floor run: three of these, none
-    // of them marked. (The ids never COLLIDED -- the counter is in-process and monotonic -- so
-    // this was lost lineage, not a wrong value.)
-    //
-    // DeckSignature cannot see it: it is folded from the snapshot's (id, upgraded,
-    // enchantment) and a renumber changes none of those. So probe object identity instead, and
-    // do it on ONE card: a reload replaces all of them at once, so the first is as good a
-    // witness as the whole deck and costs two reflection reads instead of fifty.
-    //
-    // Catching it AT THE MOMENT it happens is what makes it worth doing. On the same run, the
-    // one reload that happened to be followed immediately by a deck listing aligned exactly --
-    // 26 of 26 cards, three Strikes and four Defends included. The two that were only noticed
-    // at the next deck change had drifted by then and left 8 and 5 cards unmappable.
     private static bool DeckWasRenumbered()
     {
         try
@@ -560,15 +316,8 @@ public static class ReplayRecorder
             if (_deckKeys == null || _deckKeys.Count == 0) return false;
             var live = FirstDeckCard();
             if (live == null) return false;
-            // Reference identity, NOT CardInstances.Known. A combat clone mints its SOURCE
-            // deck card's id -- LinkClone falls through to OfLocked(source) -- so a reload that
-            // drops straight back into a fight can have every deck card already known by the
-            // time the producer ticks, and a Known-based probe would miss the renumber
-            // completely. The object itself is what the reload replaces, so compare that.
             if (_deckFirst != null && _deckFirst.TryGetTarget(out var prior))
                 return !ReferenceEquals(prior, live);
-            // No reference to compare against (first listing, or the card was collected):
-            // let the handler look, and it will refresh the reference either way.
             return true;
         }
         catch { }
@@ -592,10 +341,6 @@ public static class ReplayRecorder
         return null;
     }
 
-    // Align the renumbered deck against the listing that preceded it and state the mapping.
-    // The probe above is only a trigger: this re-reads the deck and confirms the id sets are
-    // genuinely disjoint before writing anything, so a card that merely arrived without a
-    // minting hook costs one extra read rather than producing a bogus remap.
     private static void RemapAfterInProcessReload(Snapshot s)
     {
         var before = _deckKeys;
@@ -608,8 +353,6 @@ public static class ReplayRecorder
         foreach (var entry in after)
             if (known.Contains(entry.C))
             {
-                // Not a renumber -- the ordinary signature path owns this change. Re-anchor the
-                // reference anyway: leaving it stale would re-trigger this full read every tick.
                 _deckFirst = NewDeckReference();
                 return;
             }
@@ -631,31 +374,15 @@ public static class ReplayRecorder
                 ?.Set("cards", pairs.Count > 0 ? pairs : null)
                 .Set("ambiguous", result.Ambiguous > 0 ? result.Ambiguous : (int?)null)
                 .SetFlag("exact", result.Exact)
-                // Distinguishes this from the remap written when the PROCESS restarted: that
-                // one has a header and a resume row beside it, this one has neither.
                 .SetFlag("in_process", true)
-                // The third session boundary, and the only one with no header and no resume
-                // line to carry the position. A quit-to-menu and Continue restores the run
-                // from the save, which rolls the RNG back with it -- observed on a real
-                // journal, where a fight was replayed and `shuffle` came back to the same 32
-                // it started at. Without this row stating the restored position, a consumer
-                // carrying position forward across the reload is wrong by exactly the draws
-                // the abandoned attempt made, and nothing in the stream says so.
                 .Set("rng_state", RngState.Read())
                 .Emit();
         }
         Line("deck")?.Set("cards", rows).Emit();
     }
 
-    // Re-read the deck on the next tick. Called from the hooks for upgrade and enchantment,
-    // which are the changes DeckSignature is structurally blind to; membership changes
-    // (acquire, remove, transform) move the signature on their own.
     public static void MarkDeckChanged() => _deckDirty = true;
 
-    // Folded from the snapshot rather than the live cards, because this runs on every tick and
-    // Reflect does no member caching -- walking ~25 cards per tick to read upgrade level would
-    // double an already-reflective hot path. The snapshot is free here, and MarkDeckChanged
-    // covers what it cannot express.
     private static int DeckSignature(Snapshot s)
     {
         var sig = 17;
@@ -668,20 +395,10 @@ public static class ReplayRecorder
         return sig;
     }
 
-    // Mint instance ids for the deck as it exists at run start. These are the same CardModel
-    // objects the combat piles later use, so the ids match every later line for those cards.
-    //
-    // Deck cards are MUTABLE models and keep their identity for the whole run. Canonical models
-    // (the templates a reward offers) do not: AbstractModel.ToMutable() returns `this` only when
-    // already mutable, otherwise MemberwiseClone()s a new object. That is why a card offered in
-    // a reward and the card that lands in the deck are two different objects with two different
-    // instance ids.
     private static List<ReplayLine> StartingDeck() => LiveDeck();
 
     private static List<ReplayLine> LiveDeck() => LiveDeck(out _);
 
-    // `entries` is the same deck keyed for DeckRemap, built in this pass so the reflection is
-    // not walked twice and so the live side cannot drift from what the rows say.
     private static List<ReplayLine> LiveDeck(out List<DeckRemap.Entry> entries)
     {
         var rows = new List<ReplayLine>();
@@ -694,20 +411,6 @@ public static class ReplayRecorder
             foreach (var card in cards)
             {
                 if (card == null) continue;
-                // Upgrade level and enchantment are STATED here, not left to be re-threaded
-                // from earlier rows.
-                //
-                // This is what a reload actually costs. The upgrade and enchant rows from the
-                // previous session are still in the file, so the facts are not lost -- but they
-                // name cards by an instance id whose objects the save reload destroyed, and 43%
-                // of deck cards share their card id with another copy, so re-attaching them is
-                // a guess. On a run with an Adroit Zap and four plain Defends, "which Defend"
-                // is unrecoverable and "was the Zap enchanted" should never have depended on
-                // recovering it. Reading the live card answers the second question outright.
-                //
-                // `up` is emitted even at 0 so that its ABSENCE means "this capture predates
-                // the field" rather than "this card is not upgraded" -- the same reason
-                // replay_version 2 had to be distinguishable from a null coord.
                 var enchantment = Reflect.GetMember(card, "Enchantment");
                 var instance = CardInstances.Of(card);
                 var cardId = Core.Ids.Bare(Reflect.GetString(card, "Id"));
@@ -716,22 +419,100 @@ public static class ReplayRecorder
                     ? null : Core.Ids.Bare(Reflect.GetString(enchantment, "Id"));
                 var amount = enchantment == null
                     ? 0 : Reflect.GetInt(enchantment, "Amount", 0);
+                var addedFloor = Reflect.GetMember(card, "FloorAddedToDeck") is int floor
+                    ? floor : (int?)null;
                 rows.Add(new ReplayLine("c")
                     .Set("c", instance)
                     .Set("id", cardId)
                     .Set("up", up)
                     .Set("enchantment", enchantId)
-                    .Set("amount", enchantment == null ? (int?)null : amount));
+                    .Set("amount", enchantment == null ? (int?)null : amount)
+                    .Set("added_floor", addedFloor)
+                    .Set("state", CardState(card)));
                 entries.Add(new DeckRemap.Entry(
-                    instance, ReplayJournalScan.Key(cardId, up, enchantId, amount)));
+                    instance, ReplayJournalScan.Key(cardId, up, enchantId, amount),
+                    ReplayJournalScan.Tag(addedFloor)));
             }
         }
         catch { }
         return rows;
     }
 
-    // Close the open journal, if any. Runs the close off the caller's thread so a producer
-    // tick never waits on disk.
+    private static ReplayLine? CardState(object card)
+    {
+        var props = SavedPropertiesOf(card.GetType());
+        if (props.Length == 0) return null;
+        ReplayLine? row = null;
+        foreach (var p in props)
+        {
+            object? value;
+            try { value = p.GetValue(card); }
+            catch { continue; }
+            if (value == null) continue;
+            (row ??= new ReplayLine("state", props.Length)).Set(Snake(p.Name), value);
+        }
+        return row;
+    }
+
+    private static readonly Dictionary<Type, System.Reflection.PropertyInfo[]> SavedProps = new();
+    private static Type? _savedPropertyAttr;
+    private static bool _savedPropertyAttrTried;
+
+    private static System.Reflection.PropertyInfo[] SavedPropertiesOf(Type type)
+    {
+        lock (SavedProps)
+        {
+            if (SavedProps.TryGetValue(type, out var known)) return known;
+            var found = Array.Empty<System.Reflection.PropertyInfo>();
+            try
+            {
+                if (!_savedPropertyAttrTried)
+                {
+                    _savedPropertyAttrTried = true;
+                    _savedPropertyAttr = HookPatcher.FindType(
+                        "MegaCrit.Sts2.Core.Saves.Runs.SavedPropertyAttribute");
+                    if (_savedPropertyAttr == null)
+                        MainFile.Logger.Info(
+                            "replay: SavedPropertyAttribute not found; card state omitted");
+                }
+                if (_savedPropertyAttr != null)
+                {
+                    var hits = new List<System.Reflection.PropertyInfo>();
+                    foreach (var p in type.GetProperties(
+                                 System.Reflection.BindingFlags.Public
+                                 | System.Reflection.BindingFlags.NonPublic
+                                 | System.Reflection.BindingFlags.Instance))
+                    {
+                        if (p.GetIndexParameters().Length > 0) continue;
+                        if (Attribute.GetCustomAttribute(p, _savedPropertyAttr) == null) continue;
+                        hits.Add(p);
+                    }
+                    hits.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+                    found = hits.ToArray();
+                }
+            }
+            catch { }
+            SavedProps[type] = found;
+            return found;
+        }
+    }
+
+    private static string Snake(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length + 4);
+        for (var i = 0; i < name.Length; i++)
+        {
+            var ch = name[i];
+            if (char.IsUpper(ch))
+            {
+                if (i > 0) sb.Append('_');
+                sb.Append(char.ToLowerInvariant(ch));
+            }
+            else sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
     private static void StopIfRunning(string reason)
     {
         ReplayJournal? journal;
@@ -740,10 +521,9 @@ public static class ReplayRecorder
             journal = _journal;
             _journal = null;
         }
-        _seed = null; // see Finish: a closed run must be re-openable
+        _seed = null;
         if (journal == null) return;
 
-        // Before the terminal line, while the journal is still ours to write to.
         _journal = journal;
         ReplayHooks.CloseOpenDecision();
         _journal = null;
@@ -756,8 +536,6 @@ public static class ReplayRecorder
         });
     }
 
-    // Close with the real run outcome. Called when the run ends in a win, a death, or an
-    // abandon, before the seed flips.
     public static void Finish(Snapshot s, string reason)
     {
         ReplayJournal? journal;
@@ -766,14 +544,6 @@ public static class ReplayRecorder
             journal = _journal;
             _journal = null;
         }
-        // Clear the seed latch, or the run can never be recorded again.
-        //
-        // Save-and-quit-to-menu ends the run and closes the journal, but _seed kept the seed, so
-        // hitting Continue in the SAME process hit the `seed == _seed` early return: no journal
-        // was reopened and every line for the rest of that run was silently dropped. It looked
-        // fine because the file on disk was complete up to the quit. It only ever worked when
-        // the game process restarted, which is why every reload tested until now happened to
-        // pass.
         _seed = null;
         if (journal == null) return;
 
@@ -781,13 +551,9 @@ public static class ReplayRecorder
             .Set("terminal_reason", reason)
             .Set("run_time", s.RunTime)
             .Set("floors", s.TotalFloor)
-            // The last in-run snapshot predates the killing blow (the run leaves InRun before a
-            // 10 Hz tick can observe IsGameOver), so the death latch decides both of these.
             .SetFlag("is_game_over", s.IsGameOver || ReplayHooks.PlayerDied)
             .Set("hp", ReplayHooks.PlayerDied ? 0 : s.CurrentHp)
             .Set("max_hp", s.MaxHp)
-            // [{c,id}] when we captured the deck while still in the run, so every instance's
-            // in_final_deck is exact; bare ids as the fallback.
             .Set("final_deck", (object?)_deckSnapshot ?? s.Deck.Select(d => d.Id).ToList())
             .Set("final_relics", s.Relics.Select(r => r.Id).ToList());
 
@@ -798,13 +564,6 @@ public static class ReplayRecorder
         });
     }
 
-    // A journal with no terminal line was abandoned by a crash or a kill. Append one saying
-    // so, rather than leaving a file that looks like a player who simply stopped choosing.
-    //
-    // The distinction matters downstream: an interrupted capture must be excluded from any
-    // statistic with a denominator, while an abandoned run is a real player decision and
-    // belongs in the data. Guessing between them from a missing terminal line is exactly the
-    // silent contamination this field exists to prevent.
     private static void RecoverAbandoned()
     {
         string[] files;
@@ -816,31 +575,17 @@ public static class ReplayRecorder
             try
             {
                 if (HasTerminal(file)) continue;
-                // A crash leaves at most one torn trailing record. Appending straight onto it
-                // fuses the fragment and the marker into one invalid line, losing both — the
-                // recovery marker included. Terminate the fragment first when the file does not
-                // already end on a newline.
                 if (!EndsWithNewline(file)) File.AppendAllText(file, "\n");
-                // Carry a sequence number. Every other line in every journal has one, and this
-                // was the single exception, because the scan appends from outside the writer
-                // that owns the counter. A consumer keying on (run, s) hit a missing field on
-                // exactly the line that says the capture is broken, and a contiguity check saw
-                // a hole at the end of any recovered file. Read the tail for the highest s the
-                // same way reopening a journal does.
-                //
-                // No ms, floor or act, deliberately: there is no clock and no position out here,
-                // and inventing them is worse than their absence.
                 var seq = ReplayJournal.LastSequence(file) + 1;
                 File.AppendAllText(file,
                     "{\"t\":\"end\",\"s\":" + seq + ",\"terminal_reason\":\"interrupted\"," +
                     "\"capture_status\":\"truncated\"}\n");
                 MainFile.Logger.Info($"replay: recovered {Path.GetFileName(file)} (interrupted)");
             }
-            catch { /* one unreadable journal must not stop the others */ }
+            catch {  }
         }
     }
 
-    // Whether the file's final byte is a newline, i.e. its last record is complete.
     private static bool EndsWithNewline(string file)
     {
         try
@@ -853,8 +598,6 @@ public static class ReplayRecorder
         catch { return true; }
     }
 
-    // Read the tail rather than the whole file: journals reach a few hundred KB and this runs
-    // at mod init, on the game's startup path.
     private static bool HasTerminal(string file)
     {
         try
@@ -866,12 +609,9 @@ public static class ReplayRecorder
             var buf = new byte[take];
             var read = fs.Read(buf, 0, take);
             var tail = System.Text.Encoding.UTF8.GetString(buf, 0, read);
-            // Only a COMPLETE terminal record counts. A crash mid-write can leave the opening
-            // {"t":"end" of a line that never finished, and treating that as a finished run
-            // would keep the recovery marker off a journal that genuinely needs one.
             var at = tail.LastIndexOf("\"t\":\"end\"", StringComparison.Ordinal);
             return at >= 0 && tail.IndexOf('\n', at) >= 0;
         }
-        catch { return true; } // unreadable: leave it alone rather than append to it
+        catch { return true; }
     }
 }
