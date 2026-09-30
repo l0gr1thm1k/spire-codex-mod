@@ -402,6 +402,25 @@ internal static class ReplayHooks
 
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterTakingExtraTurn", me, nameof(ExtraTurnTaken));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDeath", me, nameof(CreatureDied));
+        var creatureCmd = HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CreatureCmd");
+        attempted++; n += HookPatcher.PatchOn(harmony, creatureCmd, "Kill", me, nameof(KillStarting), 2,
+                                 firstParamType: "IReadOnlyCollection`1");
+        attempted++;
+        try
+        {
+            var damageFunnel = creatureCmd?.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(m => m.Name == "Damage" && m.GetParameters() is { Length: 7 } ps
+                                     && ps[1].ParameterType.Name == "IEnumerable`1"
+                                     && ps[2].ParameterType == typeof(decimal));
+            if (damageFunnel != null)
+            {
+                harmony.Patch(damageFunnel, prefix: new HarmonyMethod(typeof(ReplayHooks).GetMethod(
+                    nameof(DamageStarting), BindingFlags.NonPublic | BindingFlags.Static)));
+                n++;
+            }
+            else MainFile.Logger.Info("hooks: CreatureCmd.Damage(targets, amount, ...) not found");
+        }
+        catch (Exception e) { MainFile.Logger.Info($"hooks: patching Damage failed: {e.Message}"); }
         BindCombatEndEvents();
 
         attempted++; n += HookPatcher.PatchOn(harmony,
@@ -900,6 +919,52 @@ internal static class ReplayHooks
         catch { }
     }
 
+    private static readonly ConditionalWeakTable<object, string> KilledBy = new();
+    private static readonly ConditionalWeakTable<object, string> DamagedBy = new();
+
+    private static void KillStarting(object __0)
+    {
+        try
+        {
+            if (CallerId() is not { } by) return;
+            foreach (var c in Enumerate(__0))
+            {
+                KilledBy.Remove(c);
+                KilledBy.Add(c, by);
+            }
+        }
+        catch { }
+    }
+
+    private static void DamageStarting(object __1, object? __4, object? __5)
+    {
+        try
+        {
+            if (__4 != null || __5 != null) return;
+            if (CallerId() is not { } by) return;
+            foreach (var t in Enumerate(__1))
+            {
+                DamagedBy.Remove(t);
+                DamagedBy.Add(t, by);
+            }
+        }
+        catch { }
+    }
+
+    private static string? CallerId()
+    {
+        var owner = CallerOf("MegaCrit.Sts2.Core.Commands.CreatureCmd", out _);
+        if (owner == null) return null;
+        var name = owner.Name;
+        var sb = new System.Text.StringBuilder(name.Length + 8);
+        for (var i = 0; i < name.Length; i++)
+        {
+            if (i > 0 && char.IsUpper(name[i]) && !char.IsUpper(name[i - 1])) sb.Append('_');
+            sb.Append(char.ToUpperInvariant(name[i]));
+        }
+        return sb.ToString();
+    }
+
     private static void CreatureDied(object __2, bool __3)
     {
         try
@@ -909,6 +974,7 @@ internal static class ReplayHooks
                 .Set("tgt_cid", CreatureSlots.Maybe(__2))
                 .SetFlag("removal_prevented", __3)
                 .Set("cause", _doomed.Contains(__2) ? "doom" : null)
+                .Set("killed_by", KilledBy.TryGetValue(__2, out var by) ? by : null)
                 .Emit();
         }
         catch { }
@@ -1261,6 +1327,7 @@ internal static class ReplayHooks
                 .SetFlag("killed", Reflect.GetBool(__3, "WasTargetKilled"))
                 .Set("dmg_type", DamageProps(__4))
                 .Set("card", __6 == null ? null : Ids.Bare(Reflect.GetString(__6, "Id")))
+                .Set("effect", __2 == null && __6 == null && DamagedBy.TryGetValue(__5, out var by) ? by : null)
                 .Set("atk", hit == null ? null : AttackIdFor(__1, __2, __6, __4))
                 .Set("mods", why?.Mods)
                 .Set("hp_mods", why?.HpMods)
