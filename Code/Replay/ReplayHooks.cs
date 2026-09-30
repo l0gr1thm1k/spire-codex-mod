@@ -49,6 +49,15 @@ internal static class ReplayHooks
     // renamed member must be distinguishable from that. Unresolved means the field is omitted.
     private static PropertyInfo? _selectorProp;
 
+    // Whether CardModel.Keywords still exists, resolved once at install for the same reason.
+    //
+    // Keywords is EMPTY for most cards, so "this card has no keywords" and "the member was
+    // renamed" would both reach the play row as an absent field, and a consumer would read the
+    // absence as "not Ethereal". Knowing the member is still there is what makes the absence mean
+    // the first one. A bool rather than a handle: the read itself goes through Reflect so the
+    // combat-modified set is resolved per card, not cached.
+    private static bool _keywordsResolved;
+
     // What OpenSelectOffer composes for the enchantment screen, "deck_select" + "enchant".
     // Named because CardEnchanted has to tell an enchant offer from any other open select
     // before it joins to one.
@@ -608,6 +617,11 @@ internal static class ReplayHooks
         if (_selectorProp == null)
             MainFile.Logger.Info("replay-hooks: CardSelectCmd.Selector not found; "
                                  + "pick rows will omit `selector`");
+        _keywordsResolved = HookPatcher.FindType("MegaCrit.Sts2.Core.Models.CardModel")
+            ?.GetProperty("Keywords", BindingFlags.Instance | BindingFlags.Public) != null;
+        if (!_keywordsResolved)
+            MainFile.Logger.Info("replay-hooks: CardModel.Keywords not found; "
+                                 + "play rows will omit `keywords`");
 
         MainFile.Logger.Info($"replay-hooks: {n}/{attempted} patched");
     }
@@ -684,6 +698,11 @@ internal static class ReplayHooks
             // so nothing looked broken until a third act existed to disagree.
             var actModel = ElementAt(Reflect.GetMember(__0, "Acts"), __2);
             line.Set("act", __2 + 1)
+                // Which generation of this act's map this line describes. Golden Compass calls
+                // RunManager.GenerateMap() a second time for the same act, so one act emits two
+                // map lines with entirely different node graphs and joining a room.coord to the
+                // graph actually in force was an ordering guess.
+                .Set("gen", MapGeneration())
                 .Set("boss", Ids.Bare(Reflect.GetString(
                     Reflect.GetMember(actModel, "BossEncounter"), "Id")))
                 // A10+ runs a second boss. Its coord was already recorded; without this the
@@ -704,6 +723,26 @@ internal static class ReplayHooks
         catch { }
     }
 
+    // The game's own count of how many times a map has been generated this run.
+    //
+    // MapSelectionSynchronizer.MapGenerationCount is incremented in BeforeMapGenerated, which
+    // RunManager.GenerateMap calls ahead of Hook.AfterMapGenerated, so by the time we read it the
+    // number already describes THIS generation. Run-scoped and 1-based, not per-act.
+    //
+    // Omitted rather than defaulted on a failed read: the counter is at 1 or more whenever this
+    // hook fires, so a 0 would be a value the game cannot produce presented as data.
+    private static int? MapGeneration()
+    {
+        try
+        {
+            var mgr = Reflect.GetStatic(
+                HookPatcher.FindType("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance");
+            return Reflect.GetMember(
+                Reflect.GetMember(mgr, "MapSelectionSynchronizer"), "MapGenerationCount") as int?;
+        }
+        catch { return null; }
+    }
+
     private static void RoomEntered(object __0, object __1)
     {
         try
@@ -719,6 +758,18 @@ internal static class ReplayHooks
             _pendingBuyKind = null;
 
             var kind = __1.GetType().Name.Replace("Room", "").ToLowerInvariant();
+            // The RESOLVED room type, which is the only thing separating a monster, an elite and a
+            // boss: all three are CombatRoom, so the type name reads "combat" for every one of
+            // them and the corpus has no elite or boss at all. AbstractRoom.RoomType is abstract
+            // and CombatRoom overrides it as Encounter.RoomType, which is where Monster/Elite/Boss
+            // comes from.
+            //
+            // A NEW field beside `kind` rather than a correction to it, because consumers read
+            // those values today. Elite/boss is currently recoverable from the _ELITE/_BOSS suffix
+            // on vanilla encounter ids, but a convention is not a field, and it says nothing about
+            // a "?" node: MapPointType.Unknown resolves to a RoomType, and an event whose option
+            // starts a fight changes the room type without the map point changing.
+            var roomType = Reflect.GetMember(__1, "RoomType")?.ToString()?.ToLowerInvariant();
             // Floor from the live run state, not the centrally-stamped snapshot value: the
             // snapshot is up to one 10 Hz tick behind, and the first real journal filed a
             // treasure room on floor 9 whose very next line was floor 10.
@@ -728,6 +779,7 @@ internal static class ReplayHooks
             ReplayRecorder.NoteFloor(floor, Reflect.GetInt(__0, "CurrentActIndex", 0) + 1);
             ReplayRecorder.Line("room")
                 ?.Set("kind", kind)
+                .Set("room_type", roomType)
                 .Set("floor", floor >= 0 ? floor : (int?)null)
                 // Which map node this room is, in the same coord space as the map line. Without
                 // it the route is ambiguous wherever a row holds two nodes of the same kind,
@@ -1309,6 +1361,31 @@ internal static class ReplayHooks
             var target = Reflect.GetMember(__1, "Target");
             var resources = Reflect.GetMember(__1, "Resources");
             var origin = CardInstances.DeckIdOf(card);
+            // The X an X-cost card was played for: the CAPTURED value, not ResolveEnergyXValue().
+            // The resolver runs Hook.ModifyXValue over every listener in the combat, and calling a
+            // game hook by reflection from inside another hook turns a capture point into a game
+            // bug. CapturedXValue is the same number already banked -- CardModel.SpendEnergy sets
+            // it during SpendResources, ahead of OnPlayWrapper, and CardCmd.AutoPlay sets it before
+            // BeforeCardPlayed -- so it is populated by the time this runs. The one thing it misses
+            // is a Chemical X style modifier, which is what the resolver adds.
+            //
+            // Gated on CostsX because the property THROWS for a non-X card ("Only X-cost cards have
+            // a captured value"), and a throw reads as null through Reflect, which would be
+            // indistinguishable from the member having been renamed.
+            var energyCost = Reflect.GetMember(card, "EnergyCost");
+            var xValue = Reflect.GetBool(energyCost, "CostsX")
+                ? Reflect.GetMember(energyCost, "CapturedXValue") as int?
+                : null;
+            // The keywords in force for THIS play, not the printed ones. The canonical set is
+            // already derivable from `id`; what is not is a keyword granted during the fight, which
+            // CardModel.Keywords resolves through Hook.ModifyKeywordsInCombat (HexPower's Ethereal
+            // is its only implementor in the shipped assembly) on top of the card's local set.
+            // Reading it re-runs that listener walk, which is a pure query the game itself makes
+            // constantly on this same property, including inside CardCmd.AutoPlay.
+            var keywords = _keywordsResolved
+                ? Enumerate(Reflect.GetMember(card, "Keywords"))
+                      .Select(k => k.ToString()!.ToLowerInvariant()).ToList()
+                : null;
             ReplayRecorder.Line("play")
                 ?.Set("c", CardInstances.Of(card))
                 .Set("deck_c", origin > 0 ? origin : (int?)null)
@@ -1322,7 +1399,33 @@ internal static class ReplayHooks
                 .Set("target", target == null ? null : Ids.Bare(Reflect.GetString(target, "ModelId")))
                 .Set("target_cid", CreatureSlots.Maybe(target))
                 .Set("cost_paid", Reflect.GetInt(resources, "EnergySpent", -1))
+                // What the card COST, against what was actually spent. ResourceInfo has four
+                // fields and this used to read only the two Spent ones; its own doc says "if you
+                // auto-play a 3-energy-cost card, this will be 3, while EnergySpent will be 0", so
+                // every auto-played card recorded cost_paid 0 and was indistinguishable from a
+                // genuinely free one. CardCmd.AutoPlay builds exactly that ResourceInfo
+                // (EnergySpent 0, EnergyValue GetAmountToSpend()); PlayCardAction sets the two
+                // equal, so on a manual play these agree and the pair is only informative on the
+                // autoplay path. That is the path energy accounting could not audit.
+                //
+                // Read as a nullable rather than through GetInt: a 0 fallback is precisely the
+                // plausible wrong number this record keeps getting bitten by, and ResourceInfo is
+                // already on that list (the first build read "Energy", which does not exist).
+                .Set("cost_value", Reflect.GetMember(resources, "EnergyValue") as int?)
                 .Set("stars_paid", Reflect.GetInt(resources, "StarsSpent", 0))
+                .Set("stars_value", Reflect.GetMember(resources, "StarValue") as int?)
+                .Set("x_value", xValue)
+                // Where the card is headed once the play finishes, and the only place
+                // exhaust-on-play and retain-on-play are stated. Decided, not predicted: the game
+                // resolves it through Hook.ModifyCardPlayResultPileTypeAndPosition before it builds
+                // this CardPlay, so an exhaust here is the outcome rather than a keyword something
+                // later might override.
+                .Set("result_pile",
+                     Reflect.GetMember(__1, "ResultPile")?.ToString()?.ToLowerInvariant())
+                // Omitted when empty, which is most cards. The install-time lookup behind
+                // _keywordsResolved is what keeps that absence meaning "no keywords" rather than
+                // "the member moved".
+                .Set("keywords", keywords is { Count: > 0 } ? keywords : null)
                 .SetFlag("auto", Reflect.GetBool(__1, "IsAutoPlay"))
                 .Set("play_index", Reflect.GetInt(__1, "PlayIndex", 0))
                 .Set("play_count", Reflect.GetInt(__1, "PlayCount", 1))
@@ -1332,11 +1435,27 @@ internal static class ReplayHooks
         catch { }
     }
 
-    private static void CardDrawn(object __2) => CardMove("draw", __2);
+    // AfterCardDrawn(ICombatState, PlayerChoiceContext, CardModel card, bool fromHandDraw).
+    //
+    // fromHandDraw is the game's own name for "part of the initial card draws at the start of your
+    // turn"; CombatManager.SetupPlayerTurn is the only caller that passes it true, everything else
+    // defaults it to false. So it separates the turn-start deal from a draw a card, power or relic
+    // caused, and `draw` is the largest line kind in the corpus by a wide margin and was one
+    // undifferentiated stream without it.
+    private static void CardDrawn(object __2, bool __3) => CardMove("draw", __2, "turn_start", __3);
     private static void CardDiscarded(object __2) => CardMove("discard", __2);
-    private static void CardExhausted(object __2) => CardMove("exhaust", __2);
 
-    private static void CardMove(string kind, object card)
+    // AfterCardExhausted(ICombatState, PlayerChoiceContext, CardModel card, bool causedByEthereal).
+    // A card exhausting itself at end of turn because it is Ethereal is not the player spending it,
+    // and both were landing as the same plain exhaust.
+    private static void CardExhausted(object __2, bool __3)
+        => CardMove("exhaust", __2, "ethereal", __3);
+
+    // `reason` names the one bool its hook hands over to say WHY the move happened, so the three
+    // callers keep sharing one emitter rather than growing a copy each. Written with SetFlag, so
+    // the false case is explicit: "drawn, not at turn start" is a fact, not a missing read, and
+    // AfterCardDiscarded carries no such flag so discard passes none.
+    private static void CardMove(string kind, object card, string? reason = null, bool value = false)
     {
         try
         {
@@ -1344,11 +1463,13 @@ internal static class ReplayHooks
             // deck ancestor (Slimed, Wound, Dazed). `c` alone is combat-scoped and never joins
             // to card_instances.
             var origin = CardInstances.DeckIdOf(card);
-            ReplayRecorder.Line(kind)
-                ?.Set("c", CardInstances.Of(card))
+            var line = ReplayRecorder.Line(kind);
+            if (line == null) return;
+            line.Set("c", CardInstances.Of(card))
                 .Set("deck_c", origin > 0 ? origin : (int?)null)
-                .Set("id", Ids.Bare(Reflect.GetString(card, "Id")))
-                .Emit();
+                .Set("id", Ids.Bare(Reflect.GetString(card, "Id")));
+            if (reason != null) line.SetFlag(reason, value);
+            line.Emit();
         }
         catch { }
     }
@@ -1375,9 +1496,32 @@ internal static class ReplayHooks
         catch { }
     }
 
-    private static void Shuffled()
+    // AfterShuffle(ICombatState, PlayerChoiceContext, Player shuffler). Fired at the very end of
+    // CardPileCmd.Shuffle, so by now the discard pile is empty and the draw pile holds everything
+    // that went into the shuffle.
+    private static void Shuffled(object __2)
     {
-        try { ReplayRecorder.Line("shuffle")?.Emit(); } catch { }
+        try
+        {
+            // The shuffler, for the same reason the relic rows carry an owner: Shuffle is
+            // per-player, and a co-op partner reshuffling their own pile used to land in this
+            // journal as a bare row indistinguishable from ours. Null outside co-op, where every
+            // shuffle is necessarily ours.
+            //
+            // n_draw is the draw pile AFTER the shuffle, which is the count that was shuffled
+            // together. It is what makes the row worth reading at all: a shuffle resets draw order,
+            // and the corpus holds thousands of these saying only that one happened.
+            var cards = Reflect.GetMember(
+                Reflect.GetMember(Reflect.GetMember(__2, "PlayerCombatState"), "DrawPile"),
+                "Cards");
+            ReplayRecorder.Line("shuffle")
+                ?.Set("mine", Mine(__2))
+                // Omitted, not zeroed, on a failed read: a shuffle cannot leave an empty draw pile,
+                // so a 0 here would be a number the game never produces presented as data.
+                .Set("n_draw", cards == null ? (int?)null : Enumerate(cards).Count())
+                .Emit();
+        }
+        catch { }
     }
 
     // AfterDamageGiven(choiceContext, combatState, dealer, DamageResult, props, target, cardSource).
@@ -2828,22 +2972,55 @@ internal static class ReplayHooks
         catch { }
     }
 
-    private static void PotionUsed(object __2) => Potion("potion_used", __2);
+    // AfterPotionUsed(IRunState, ICombatState?, PotionModel potion, Creature? target). The target
+    // was being discarded, so a Fire Potion thrown at one of three Corpse Slugs said which potion
+    // and not which body, and the `hit` rows it causes name no potion to join back on.
+    // AfterPotionProcured and AfterPotionDiscarded have no target argument at all.
+    private static void PotionUsed(object __2, object __3) => Potion("potion_used", __2, __3);
     private static void PotionProcured(object __2) => Potion("potion_got", __2);
     private static void PotionDiscarded(object __2) => Potion("potion_dropped", __2);
 
-    private static void Potion(string kind, object potion)
+    private static void Potion(string kind, object potion, object? target = null)
     {
         try
         {
-            ReplayRecorder.Line(kind)?.Set("id", Ids.Bare(Reflect.GetString(potion, "Id"))).Emit();
+            ReplayRecorder.Line(kind)
+                ?.Set("id", Ids.Bare(Reflect.GetString(potion, "Id")))
+                // Model id AND slot, the same pair and the same field names as the play row: the id
+                // names a species, so against two of the same enemy it cannot say which one drank
+                // the debuff. Both null for an untargeted potion, which is most of them.
+                .Set("target",
+                     target == null ? null : Ids.Bare(Reflect.GetString(target, "ModelId")))
+                .Set("target_cid", CreatureSlots.Maybe(target))
+                .Emit();
         }
         catch { }
     }
 
-    private static void RestHeal()
+    // AfterRestSiteHeal(IRunState, Player, bool isMimicked). isMimicked is true when the heal came
+    // from somewhere that is not a campfire: PlayerCmd.MimicRestSiteHeal calls
+    // HealRestSiteOption.ExecuteRestSiteHeal(player, isMimicked: true), and DenseVegetation's Rest
+    // option is its only caller in the shipped assembly. The flag was discarded, so the row said
+    // "campfire heal" for an event.
+    //
+    // The flag is ADDED rather than the row suppressed. Verified in PLAY0034-1790606094 at s=382: a
+    // rest option=heal filed on floor 9 while the open room was the DENSE_VEGETATION event, so
+    // anything counting campfire visits over-counts by one. Deleting the row would fix that count
+    // and destroy the only witness that the option was taken -- the `hp` row the heal produces says
+    // a heal happened, not that an event offered a rest -- and silence is the failure this record
+    // exists to avoid. A consumer counting campfires filters on the flag instead.
+    private static void RestHeal(bool __2)
     {
-        try { ReplayRecorder.Line("rest")?.Set("option", "heal").Emit(); } catch { }
+        try
+        {
+            ReplayRecorder.Line("rest")
+                ?.Set("option", "heal")
+                // SetFlag, so the false case is written too: a heal with no flag at all would be a
+                // journal from before this existed, and that is worth being able to tell apart.
+                .SetFlag("mimicked", __2)
+                .Emit();
+        }
+        catch { }
     }
 
     private static void RestSmith()
