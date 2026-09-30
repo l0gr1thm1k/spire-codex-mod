@@ -266,6 +266,12 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterSideTurnStart", me, nameof(SideTurnStart));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterTurnEnd|BeforeTurnEnd|AfterSideTurnEnd", me, nameof(TurnEnd));
         attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeCardPlayed", me, nameof(CardPlayed));
+        // An auto-play the card refuses. CardCmd.AutoPlay's four refusal paths all go through
+        // this private helper and nothing else calls it; ShouldPlay is read alongside so the
+        // row can say which refusal it was.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "MoveToResultPileWithoutPlaying", me, nameof(AutoPlayDeclined), 2);
+        attempted++; n += HookPatcher.Patch(harmony, hook, "ShouldPlay", me, nameof(PlayVetoed), postfix: true);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterCardDrawn", me, nameof(CardDrawn));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterCardDiscarded", me, nameof(CardDiscarded));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterCardExhausted", me, nameof(CardExhausted));
@@ -828,6 +834,49 @@ internal static class ReplayHooks
                 .Set("play_index", Reflect.GetInt(__1, "PlayIndex", 0))
                 .Set("play_count", Reflect.GetInt(__1, "PlayCount", 1))
                 .Set("turn", Reflect.GetInt(__0, "RoundNumber", 0))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // The last card Hook.ShouldPlay refused, compared by identity against the card AutoPlay
+    // declines on its next line. A stale value can do no worse than fail to match.
+    private static object? _vetoedCard;
+
+    // Hook.ShouldPlay(combatState, card, out preventer, autoPlayType) -> bool, postfix.
+    private static void PlayVetoed(object __1, bool __result)
+    {
+        if (!__result) _vetoedCard = __1;
+        else if (ReferenceEquals(__1, _vetoedCard)) _vetoedCard = null;
+    }
+
+    // CardCmd.MoveToResultPileWithoutPlaying(choiceContext, card), prefix. Reached only from
+    // CardCmd.AutoPlay, when the card it was handed will not be played: it is Unplayable, a hook
+    // refused it, or it needs a target and there is none.
+    //
+    // A successful auto-play writes a `play` row with auto=true; a refused one wrote nothing,
+    // which reads exactly like a turn on which nothing was pulled. On 2G4KM0SCEARZ Mayhem pulled
+    // Dowsing (Unplayable) on turn 5 and Cloak of Stars on turn 6, and with no witness for turn
+    // 5 the turn-6 play was credited a turn early -- the card came off the discard a turn
+    // before it should have, and the draw order fell apart from there.
+    //
+    // What pulled the card (Mayhem, Havoc, Distilled Chaos) is not in scope here, for this row
+    // or for the auto `play` row; the row before it is the attribution.
+    private static void AutoPlayDeclined(object __1)
+    {
+        try
+        {
+            var reason = Enumerate(Reflect.GetMember(__1, "Keywords"))
+                             .Any(k => k.ToString() == "Unplayable") ? "unplayable"
+                : ReferenceEquals(__1, _vetoedCard) ? "blocked"
+                : "no_target";
+            var origin = CardInstances.DeckIdOf(__1);
+            ReplayRecorder.Line("autoplay_declined")
+                ?.Set("c", CardInstances.Of(__1))
+                .Set("deck_c", origin > 0 ? origin : (int?)null)
+                .Set("id", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Set("up", Reflect.GetInt(__1, "CurrentUpgradeLevel", 0))
+                .Set("reason", reason)
                 .Emit();
         }
         catch { }
