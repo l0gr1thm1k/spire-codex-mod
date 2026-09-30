@@ -289,6 +289,17 @@ internal static class ReplayHooks
             HookPatcher.FindType("MegaCrit.Sts2.Core.Models.Powers.DoomPower"),
             "DoomKill", me, nameof(DoomKilled), 1);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterBlockGained", me, nameof(BlockGained));
+        // Energy. The turn's refill, and every gain and loss that goes through PlayerCmd. A
+        // card's own cost is not here: CardModel.SpendEnergy takes it straight off
+        // PlayerCombatState, and `play.cost_paid` already records it.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterEnergyReset", me, nameof(EnergyReset));
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Players.PlayerCombatState"),
+            "GainEnergy", me, nameof(EnergyGained), 1, postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.PlayerCmd"),
+                                 "LoseEnergy", me, nameof(EnergyLosing), 2);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.PlayerCmd"),
+                                 "LoseEnergy", me, nameof(EnergyLost), 2, postfix: true);
         // No first-party hook exists for either of these, so they patch game internals by name
         // and degrade to "that line stops appearing" if a patch renames them.
         attempted++; n += HookPatcher.PatchOn(harmony,
@@ -1107,6 +1118,76 @@ internal static class ReplayHooks
                 .Set("src_cid", CreatureSlots.Maybe(__1))
                 .Set("n", (int)__2)
                 .Set("card", __4 == null ? null : Ids.Bare(Reflect.GetString(__4, "Id")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // The energy pool had no witness at all. A play's cost_paid says what was spent, and nothing
+    // said what was there to spend, so a play made on energy the reader did not know about --
+    // a gain with no row, a refill a relic changed -- read as the player spending energy they
+    // did not have, and the fight's replay stopped on it. `energy` is the pool after the
+    // change, `d` the change itself.
+    //
+    // Hook.AfterEnergyReset(combatState, player): the start-of-turn refill, after the game has
+    // either reset to max or (when a hook keeps it) added max to what was left.
+    private static void EnergyReset(object __1)
+    {
+        try
+        {
+            var pcs = Reflect.GetMember(__1, "PlayerCombatState");
+            ReplayRecorder.Line("energy")
+                ?.Set("reason", "turn")
+                .Set("energy", Reflect.GetInt(pcs, "Energy", 0))
+                .Set("max_energy", Reflect.GetInt(pcs, "MaxEnergy", 0))
+                .Set("mine", Mine(__1))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // PlayerCombatState.GainEnergy(amount), postfix. Only PlayerCmd.GainEnergy calls it, after
+    // ModifyEnergyGain, so `d` is the amount that actually landed.
+    private static void EnergyGained(object __instance, decimal __0)
+    {
+        try
+        {
+            ReplayRecorder.Line("energy")
+                ?.Set("reason", "gain")
+                .Set("d", (int)__0)
+                .Set("energy", Reflect.GetInt(__instance, "Energy", 0))
+                .Set("mine", Mine(Reflect.GetMember(__instance, "_player")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // PlayerCmd.LoseEnergy(amount, player). Synchronous, and it does nothing for a non-positive
+    // amount or while a combat is ending, so the pool is read on both sides and the row written
+    // only when it moved.
+    private static int _energyBeforeLoss;
+
+    private static void EnergyLosing(object __1)
+    {
+        try
+        {
+            _energyBeforeLoss = Reflect.GetInt(Reflect.GetMember(__1, "PlayerCombatState"), "Energy", 0);
+        }
+        catch { }
+    }
+
+    private static void EnergyLost(object __1)
+    {
+        try
+        {
+            var after = Reflect.GetInt(Reflect.GetMember(__1, "PlayerCombatState"), "Energy", 0);
+            var d = after - _energyBeforeLoss;
+            if (d == 0) return;
+            ReplayRecorder.Line("energy")
+                ?.Set("reason", "loss")
+                .Set("d", d)
+                .Set("energy", after)
+                .Set("mine", Mine(__1))
                 .Emit();
         }
         catch { }
