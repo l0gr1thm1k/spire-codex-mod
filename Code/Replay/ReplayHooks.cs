@@ -300,6 +300,23 @@ internal static class ReplayHooks
                                  "LoseEnergy", me, nameof(EnergyLosing), 2);
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.PlayerCmd"),
                                  "LoseEnergy", me, nameof(EnergyLost), 2, postfix: true);
+        // Stars, the Regent's second resource, on the same terms: every gain and every loss
+        // through PlayerCmd. A card's own star cost is not here -- CardModel.SpendStars takes it
+        // straight off PlayerCombatState, including the excess-energy-paid-in-stars case, and
+        // `play.stars_paid` already records it. There is no turn refill: the pool starts at 0 in
+        // each fight, because PlayerCombatState is rebuilt per combat.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Players.PlayerCombatState"),
+            "GainStars", me, nameof(StarsGained), 1, postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.PlayerCmd"),
+                                 "LoseStars", me, nameof(StarsLosing), 2);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.PlayerCmd"),
+                                 "LoseStars", me, nameof(StarsLost), 2, postfix: true);
+        // A cost paid OUTSIDE a play. Whispering Earring calls SpendResources() and then
+        // AutoPlay(skipXCapture: true), so the play row that follows says it cost nothing while
+        // both pools really paid. SpendResources is the one funnel for a card's cost.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Models.CardModel"),
+                                 "SpendResources", me, nameof(ResourcesSpent), 0, postfix: true);
         // No first-party hook exists for either of these, so they patch game internals by name
         // and degrade to "that line stops appearing" if a patch renames them.
         attempted++; n += HookPatcher.PatchOn(harmony,
@@ -863,6 +880,7 @@ internal static class ReplayHooks
             var target = Reflect.GetMember(__1, "Target");
             var resources = Reflect.GetMember(__1, "Resources");
             var origin = CardInstances.DeckIdOf(card);
+            var prepaid = TakePrepaid(card, Reflect.GetBool(__1, "IsAutoPlay"));
             ReplayRecorder.Line("play")
                 ?.Set("c", CardInstances.Of(card))
                 .Set("deck_c", origin > 0 ? origin : (int?)null)
@@ -878,6 +896,11 @@ internal static class ReplayHooks
                 .Set("cost_paid", Reflect.GetInt(resources, "EnergySpent", -1))
                 .Set("stars_paid", Reflect.GetInt(resources, "StarsSpent", 0))
                 .SetFlag("auto", Reflect.GetBool(__1, "IsAutoPlay"))
+                // Only on an auto-play whose cost was paid before it (Whispering Earring). The
+                // play itself still reports cost_paid 0, as every auto-play does; these say what
+                // the pools actually lost for it.
+                .Set("prepaid_energy", prepaid is { Energy: > 0 } pe ? pe.Energy : (int?)null)
+                .Set("prepaid_stars", prepaid is { Stars: > 0 } ps ? ps.Stars : (int?)null)
                 .Set("play_index", Reflect.GetInt(__1, "PlayIndex", 0))
                 .Set("play_count", Reflect.GetInt(__1, "PlayCount", 1))
                 .Set("turn", Reflect.GetInt(__0, "RoundNumber", 0))
@@ -927,6 +950,36 @@ internal static class ReplayHooks
                 .Emit();
         }
         catch { }
+    }
+
+    // The last cost CardModel.SpendResources paid, and for which card. PlayCardAction pays and
+    // then plays with the spend on the CardPlay; Whispering Earring pays and then AUTO-plays, and
+    // the CardPlay it builds carries EnergySpent 0 and StarsSpent 0.
+    private static object? _prepaidCard;
+    private static (int Energy, int Stars) _prepaid;
+
+    // CardModel.SpendResources() -> Task<(int, int)>, postfix. The spend is (energy, stars).
+    private static void ResourcesSpent(object __instance, Task<ValueTuple<int, int>> __result)
+    {
+        try
+        {
+            __result?.ContinueWith(t =>
+            {
+                if (t.Status != TaskStatus.RanToCompletion) return;
+                _prepaidCard = __instance;
+                _prepaid = (t.Result.Item1, t.Result.Item2);
+            }, TaskContinuationOptions.ExecuteSynchronously);
+        }
+        catch { }
+    }
+
+    // The prepaid cost for this play, consumed. Only an auto-play can have one: a manual play's
+    // own spend is already its cost_paid and stars_paid.
+    private static (int Energy, int Stars)? TakePrepaid(object? card, bool isAutoPlay)
+    {
+        if (card == null || !ReferenceEquals(card, _prepaidCard)) return null;
+        _prepaidCard = null;
+        return isAutoPlay ? _prepaid : null;
     }
 
     private static void CardDrawn(object __2) => CardMove("draw", __2);
@@ -1190,6 +1243,57 @@ internal static class ReplayHooks
                 ?.Set("reason", "loss")
                 .Set("d", d)
                 .Set("energy", after)
+                .Set("mine", Mine(__1))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Stars had no witness either. `play.stars_paid` says what a card spent, and nothing said
+    // where stars came from or how many were on hand, so a reader that missed one gain -- 18
+    // models call PlayerCmd.GainStars -- held a pool too small for the next star-cost card and
+    // refused a play the player made. `stars` is the pool after the change, `d` the change.
+    //
+    // PlayerCombatState.GainStars(amount), postfix. Only PlayerCmd.GainStars calls it, and only
+    // after Hook.ShouldGainStars allowed the gain, so a vetoed gain writes nothing.
+    private static void StarsGained(object __instance, decimal __0)
+    {
+        try
+        {
+            ReplayRecorder.Line("stars")
+                ?.Set("reason", "gain")
+                .Set("d", (int)__0)
+                .Set("stars", Reflect.GetInt(__instance, "Stars", 0))
+                .Set("mine", Mine(Reflect.GetMember(__instance, "_player")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // PlayerCmd.LoseStars(amount, player). Synchronous and a no-op while a combat is ending, so
+    // read on both sides like LoseEnergy.
+    private static int _starsBeforeLoss;
+
+    private static void StarsLosing(object __1)
+    {
+        try
+        {
+            _starsBeforeLoss = Reflect.GetInt(Reflect.GetMember(__1, "PlayerCombatState"), "Stars", 0);
+        }
+        catch { }
+    }
+
+    private static void StarsLost(object __1)
+    {
+        try
+        {
+            var after = Reflect.GetInt(Reflect.GetMember(__1, "PlayerCombatState"), "Stars", 0);
+            var d = after - _starsBeforeLoss;
+            if (d == 0) return;
+            ReplayRecorder.Line("stars")
+                ?.Set("reason", "loss")
+                .Set("d", d)
+                .Set("stars", after)
                 .Set("mine", Mine(__1))
                 .Emit();
         }
