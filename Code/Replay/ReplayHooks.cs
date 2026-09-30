@@ -280,6 +280,37 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDamageReceived", me, nameof(DamageReceived));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPowerAmountChanged", me, nameof(PowerChanged));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterBlockGained", me, nameof(BlockGained));
+
+        // --- block loss --------------------------------------------------------------
+        // Block only ever went UP in the journal: 34531 gain rows and not one row anywhere that
+        // removed any of it, so a consumer summing them got a level that never reset and "how
+        // much block did I have when that hit landed" had no answer. These five cover every way
+        // block leaves a creature except the block damage eats, which the hit row already carries
+        // as `blocked`.
+        //
+        // Prefix on the private Creature.ClearBlock(), which is only reached from
+        // Creature.AfterTurnStart. Hook.AfterBlockCleared is the game's own signal for the
+        // turn-start wipe but does not carry the amount and fires after the block is already
+        // gone, so the amount has to be latched before the body runs. Prefix and not postfix
+        // because ClearBlock is async Task: a postfix fires at its first await, not at
+        // completion, and in the prevented branch that await is the hook we also patch below.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Creatures.Creature"),
+            "ClearBlock", me, nameof(BlockClearing), 0);
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterBlockCleared", me, nameof(BlockCleared));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPreventingBlockClear", me, nameof(BlockClearPrevented));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterBlockBroken", me, nameof(BlockBroken));
+        // Creature.LoseBlockInternal(amount) rather than CreatureCmd.LoseBlock, which is what
+        // has no hook and what Expose calls. LoseBlock is async Task and keeps its guards
+        // INSIDE the method (combat over or ending, dead creature, non-positive amount), so a
+        // prefix there emits rows for strips that never happen, and the amount it is handed is
+        // the amount REQUESTED: LoseBlockInternal clamps at zero, so a strip for more block than
+        // the creature holds would record more block removed than existed. The internal runs
+        // only when the removal actually happens and still sees the pre-clamp Block, so
+        // min(amount, Block) is the exact figure.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Creatures.Creature"),
+            "LoseBlockInternal", me, nameof(BlockLost), 1);
         // No first-party hook exists for either of these, so they patch game internals by name
         // and degrade to "that line stops appearing" if a patch renames them.
         attempted++; n += HookPatcher.PatchOn(harmony,
@@ -687,6 +718,32 @@ internal static class ReplayHooks
         => creature == null ? "effect"
             : Reflect.GetMember(creature, "IsPlayer") is true ? "player"
             : Ids.Bare(Reflect.GetString(creature, "ModelId")) ?? "unknown";
+
+    // A numeric member read as int?, null when the member is absent rather than 0.
+    //
+    // Reflect.GetInt exists and is not used for these: its fallback reports a real 0 for a
+    // renamed property, which is how DamageResult.HpLost (a name that does not exist on the
+    // type) shipped a journal in which every hit dealt 0 damage. Everything this reads is
+    // declared `int` on the game type, so `is int` both converts and proves the read.
+    private static int? IntOf(object? target, string name)
+        => Reflect.GetMember(target, name) is int i ? i : (int?)null;
+
+    // A [Flags] ValueProp as a list of lowercase flag names, the same shape move.intents uses.
+    //
+    // The game's own doc on the enum calls it "Aka damage type": Unblockable is HP loss like
+    // Poison, Unpowered is relics/potions/powers, Move is attack cards and enemy attacks,
+    // SkipHurtAnim is presentation. A flags value stringifies as "Move" or "Move, SkipHurtAnim",
+    // so it is split rather than written through; a value with no flags set stringifies as "0",
+    // which is not a prop name, so that reads as "no props" and the field is dropped instead of
+    // writing a bogus one.
+    private static List<string>? DamageProps(object? props)
+    {
+        var raw = props?.ToString();
+        if (string.IsNullOrEmpty(raw) || raw == "0") return null;
+        var names = raw.Split(',').Select(x => x.Trim().ToLowerInvariant())
+                       .Where(x => x.Length > 0).ToList();
+        return names.Count > 0 ? names : null;
+    }
 
     // --- combat ----------------------------------------------------------------------
 
@@ -1262,7 +1319,16 @@ internal static class ReplayHooks
     // BlockLost, which do not exist on the type, so every hit in the first real journal
     // recorded 0 damage. Reflection misses are silent by design here, which is exactly why a
     // wrong field name produces plausible-looking zeros instead of an error.
-    private static void DamageGiven(object __2, object __3, object __5, object __6)
+    //
+    // `dmg` is UnblockedDamage and still means exactly that: HP actually removed. It is NOT the
+    // damage the blow dealt. The game computes that as `item.UnblockedDamage +
+    // item.OverkillDamage`, so on a lethal hit UnblockedDamage stops at the target's remaining
+    // HP and the swing is truncated by the overkill, on precisely the hits worth grading. Rather
+    // than redefine a field 35k rows already use, the missing half is added as `overkill`:
+    // damage dealt = dmg + (overkill ?? 0). DamageResult.TotalDamage is deliberately NOT
+    // recorded; it is a derived property, BlockedDamage + UnblockedDamage, both of which are
+    // already on this row, and it is truncated on a lethal hit for the same reason dmg is.
+    private static void DamageGiven(object __2, object __3, object __4, object __5, object __6)
     {
         try
         {
@@ -1286,7 +1352,21 @@ internal static class ReplayHooks
                 .Set("dst_cid", CreatureSlots.Maybe(__5))
                 .Set("dmg", Reflect.GetInt(__3, "UnblockedDamage", 0))
                 .Set("blocked", Reflect.GetInt(__3, "BlockedDamage", 0))
+                // Damage past 0 HP. Written only when it is nonzero, which is almost never, so
+                // its absence means "no overkill" on every hit that is not a kill. Pair it with
+                // `dmg` to get what the blow actually dealt.
+                .Set("overkill", IntOf(__3, "OverkillDamage") is int over && over > 0 ? over : (int?)null)
+                // dmg:0 blocked:9 cannot tell "fully blocked" from "reduced to nothing", which is
+                // the difference between a Defend that worked and a Defend that was irrelevant.
+                // Written only when true, same as overkill.
+                .Set("full_block", Reflect.GetMember(__3, "WasFullyBlocked") is true ? true : (bool?)null)
                 .SetFlag("killed", Reflect.GetBool(__3, "WasTargetKilled"))
+                // What KIND of damage this was, from the hook's own ValueProp. Poison, thorns and
+                // relic pings all arrive with card null and no dealer worth naming, so they were
+                // indistinguishable from an unattributed attack: FlameBarrierPower calls
+                // CreatureCmd.Damage with the owner as dealer and ValueProp.Unpowered, which read
+                // as the player attacking the enemy in the middle of the enemy's turn.
+                .Set("dmg_type", DamageProps(__4))
                 .Set("card", __6 == null ? null : Ids.Bare(Reflect.GetString(__6, "Id")))
                 .Emit();
         }
@@ -1296,7 +1376,7 @@ internal static class ReplayHooks
     // AfterDamageReceived(choiceContext, runState, combatState, target, DamageResult, props,
     // dealer, cardSource). In combat this is the same blow DamageGiven already recorded, so it
     // only emits OUT of combat (combatState null): event damage, which DamageGiven never sees.
-    private static void DamageReceived(object __2, object __3, object __4)
+    private static void DamageReceived(object __2, object __3, object __4, object __5)
     {
         try
         {
@@ -1305,6 +1385,11 @@ internal static class ReplayHooks
             ReplayRecorder.Line("hp_loss")
                 ?.Set("dmg", Reflect.GetInt(__4, "UnblockedDamage", 0))
                 .Set("blocked", Reflect.GetInt(__4, "BlockedDamage", 0))
+                // Same two additions as the hit row, and for the same reason: out of combat the
+                // damage that matters is an event cost or a curse tick, and dmg alone truncates a
+                // lethal one. full_block is left off here, there is no block outside a fight.
+                .Set("overkill", IntOf(__4, "OverkillDamage") is int over && over > 0 ? over : (int?)null)
+                .Set("dmg_type", DamageProps(__5))
                 .Emit();
         }
         catch { }
@@ -1597,6 +1682,42 @@ internal static class ReplayHooks
         catch { }
     }
 
+    // --- block -----------------------------------------------------------------------
+    //
+    // One row kind for the whole of block, gains and losses together, because the only question
+    // block rows exist to answer is "how much did this body have at that moment" and that has to
+    // be one series. The shape:
+    //
+    //   n       signed delta. Positive gained, negative removed. Absent when nothing moved
+    //           (`prevented`, `broken`). A consumer that only sums n gets the level, without
+    //           having to know which reasons subtract.
+    //   left    the absolute Block on that body immediately after the event, so every row
+    //           re-anchors the sum instead of letting it drift. Omitted, never 0, when the read
+    //           fails.
+    //   reason  gained | cleared | prevented | broken | lost.
+    //
+    // A `reason` field beats separate row kinds here for two reasons. A consumer that does not
+    // know a reason still gets the arithmetic right from signed n, where an unknown row kind
+    // would simply be skipped and the level would be wrong. And the reasons are not
+    // independent: `broken` describes the same moment a `lost` or a hit row already accounts
+    // for, so they have to be readable as one ordered series, which separate kinds fight.
+    //
+    // ONE PATH DELIBERATELY EMITS NO ROW: block eaten by damage. CreatureCmd.Damage takes it
+    // through Creature.DamageBlockInternal, which nothing else calls and which has no hook, and
+    // the amount is already on the hit row as `blocked`. Emitting it here as well would put the
+    // same number in two places and invite a double count, and it would add a row to every
+    // damaging hit in the file. So the rule for a consumer is: level = sum of block.n minus the
+    // hit.blocked of every hit on that body since, re-anchored by `left` on the next block row.
+    // `broken` exists to make that self-checking: it asserts the level is 0 at that point, which
+    // is exactly what a partial consumption between rows would otherwise hide.
+
+    // Block latched immediately before the turn-start wipe, keyed by the creature it is about to
+    // come off. CombatManager.StartTurn runs every creature's AfterTurnStart, which is what calls
+    // ClearBlock, in one loop and only then fires Hook.AfterBlockCleared for every creature in a
+    // second loop, so a single field would be overwritten by the next creature before the hook
+    // that needs it fires. Weak keys, same as MoveOwners: a creature the game drops is collected.
+    private static readonly ConditionalWeakTable<object, object> BlockBeforeClear = new();
+
     // AfterBlockGained(combatState, creature, amount, props, cardSource)
     private static void BlockGained(object __1, decimal __2, object __4)
     {
@@ -1605,15 +1726,131 @@ internal static class ReplayHooks
             // Monster block is recorded too. This used to return early for anything but the
             // player, so a monster that spent its turn gaining Block left nothing in the
             // journal at all and the turn read as "nothing recorded".
-            ReplayRecorder.Line("block")
-                ?.Set("src", CreatureRef(__1))
-                .Set("src_cid", CreatureSlots.Maybe(__1))
-                .Set("n", (int)__2)
-                .Set("card", __4 == null ? null : Ids.Bare(Reflect.GetString(__4, "Id")))
+            BlockRow(__1, (int)__2, "gained")
+                ?.Set("card", __4 == null ? null : Ids.Bare(Reflect.GetString(__4, "Id")))
                 .Emit();
         }
         catch { }
     }
+
+    // Creature.ClearBlock(), private, prefix. Latch only, no row: at this point it is not yet
+    // known whether the wipe will happen at all, because the body asks Hook.ShouldClearBlock and
+    // Barricade or Burrowed can refuse it. The row is written by whichever of the two hooks below
+    // then fires.
+    private static void BlockClearing(object __instance)
+    {
+        try
+        {
+            if (__instance == null) return;
+            BlockBeforeClear.Remove(__instance);
+            if (IntOf(__instance, "Block") is int block && block > 0)
+                BlockBeforeClear.Add(__instance, block);
+        }
+        catch { }
+    }
+
+    // AfterBlockCleared(combatState, creature). The turn-start wipe.
+    //
+    // This hook fires UNCONDITIONALLY for every creature starting the turn, which is three
+    // things it does not mean. It fires for a creature that had no block. It fires for the player
+    // on turn 1, whose AfterTurnStart returns before ClearBlock is ever called. And it fires for a
+    // creature whose wipe was prevented. So the row is written only when the latch says this body
+    // actually held block and the body now reads exactly 0, the one combination that means the
+    // block is gone. Everything else emits nothing rather than a zeroing row that is wrong.
+    //
+    // The consequence of that strictness: if the private ClearBlock is ever renamed, the latch is
+    // always empty and clears stop appearing entirely rather than appearing without an amount.
+    // That is the intended trade, and the "n/m patched" count is what surfaces it.
+    private static void BlockCleared(object __1)
+    {
+        try
+        {
+            if (__1 == null) return;
+            if (!BlockBeforeClear.TryGetValue(__1, out var latched)) return;
+            BlockBeforeClear.Remove(__1);
+            if (latched is not int had || had <= 0) return;
+            if (IntOf(__1, "Block") != 0) return; // prevented, or something already put block back
+            BlockRow(__1, -had, "cleared").Emit();
+        }
+        catch { }
+    }
+
+    // AfterPreventingBlockClear(combatState, preventer, creature). Barricade and Burrowed.
+    //
+    // Without this row a consumer that zeroes block at every turn start is wrong for exactly the
+    // two cases where carried block is the whole point of the build, and it has nothing to tell
+    // it so: the `cleared` row it would be pairing with simply never arrives. No `n`, nothing
+    // moved. `left` states the level that survived, which makes the row an assertion rather than
+    // a delta. `by` is the model that refused, so "why did this block survive" is answered on the
+    // row instead of inferred from the relic and power list.
+    private static void BlockClearPrevented(object __1, object __2)
+    {
+        try
+        {
+            if (__2 == null) return;
+            // Drop the latch: the wipe did not happen, so the AfterBlockCleared that fires for
+            // this same creature in StartTurn's next loop must not write a `cleared` row.
+            BlockBeforeClear.Remove(__2);
+            BlockRow(__2, null, "prevented")
+                ?.Set("by", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // AfterBlockBroken(combatState, creature). Fired from CreatureCmd.LoseBlock when a strip takes
+    // the last of it, and from the WasBlockBroken sweep in CreatureCmd.Damage immediately before
+    // the AfterDamageGiven that produces the hit row for the same blow.
+    //
+    // No `n` on purpose. The amount is already accounted for both times this fires: a strip writes
+    // its own `lost` row a moment earlier, and block eaten by damage is on the hit row as
+    // `blocked`. A delta here would double count either one. What the row adds is the zero
+    // assertion described above, which is the only checkpoint a consumer gets for the damage path.
+    private static void BlockBroken(object __1)
+    {
+        try
+        {
+            if (__1 == null) return;
+            BlockRow(__1, null, "broken").Emit();
+        }
+        catch { }
+    }
+
+    // Creature.LoseBlockInternal(amount), prefix. Every block removal that is neither damage nor
+    // the turn-start wipe funnels through here: CreatureCmd.LoseBlock, which is the Expose-style
+    // strip and has no hook of its own, and Player.AfterCombatEnd's teardown wipe, which has no
+    // witness anywhere else. Nothing else in the assembly calls it.
+    //
+    // A prefix, so Block is still the pre-clamp level and min(amount, Block) is the exact figure
+    // LoseBlockInternal is about to remove. `left` is computed rather than read for the same
+    // reason: the removal has not happened yet.
+    //
+    // `reason` stays the generic "lost" for both callers. The prefix cannot see which one called
+    // it, and naming the cause wrong is worse than not naming it; the number is exact either way.
+    // A consumer that needs to tell them apart has position: the teardown lands at combat end.
+    private static void BlockLost(object __instance, decimal __0)
+    {
+        try
+        {
+            if (__instance == null || __0 <= 0m) return;
+            if (IntOf(__instance, "Block") is not int block || block <= 0) return;
+            var removed = (int)Math.Min(__0, block);
+            if (removed <= 0) return;
+            BlockRow(__instance, -removed, "lost", block - removed).Emit();
+        }
+        catch { }
+    }
+
+    // The one shape every block row is built from. `left` defaults to reading the creature, which
+    // is right for the three hooks that fire after the fact; BlockLost passes it explicitly
+    // because it runs before the removal. Omitted, never 0, when Block cannot be read.
+    private static ReplayLine? BlockRow(object creature, int? n, string reason, int? left = null)
+        => ReplayRecorder.Line("block")
+            ?.Set("src", CreatureRef(creature))
+            .Set("src_cid", CreatureSlots.Maybe(creature))
+            .Set("n", n)
+            .Set("left", left ?? IntOf(creature, "Block"))
+            .Set("reason", reason);
 
     // AfterCurrentHpChanged(runState, combatState, creature, delta) — every HP delta, not just
     // combat hits, so event and campfire HP movement is in the record too.
