@@ -187,6 +187,9 @@ public static class ReplayRecorder
             .Set("starting_max_hp", s.MaxHp > 0 ? s.MaxHp : (int?)null)
             .Set("game_mode", s.GameMode?.ToLowerInvariant())
             .Set("modifiers", s.Modifiers)
+            .Set("mods", LoadedMods())
+            .Set("harmony_owners", HarmonyOwners())
+            .Set("full_console", FullConsole())
             .Set("start_time", startTime)
             .Set("platform_type", "steam")
             .Set("player_count", s.PlayerCount)
@@ -195,6 +198,53 @@ public static class ReplayRecorder
             .Set("starting_relics", s.Relics.Select(r => r.Id).ToList())
             .Set("rng_state", RngState.Read())
             .Emit();
+    }
+
+    private static List<ReplayLine>? LoadedMods()
+    {
+        try
+        {
+            var manager = Core.HookPatcher.FindType("MegaCrit.Sts2.Core.Modding.ModManager");
+            var loaded = manager?.GetMethod("GetLoadedMods", System.Type.EmptyTypes)?.Invoke(null, null);
+            if (loaded is not System.Collections.IEnumerable mods) return null;
+            var rows = new List<ReplayLine>();
+            foreach (var mod in mods)
+            {
+                var manifest = Reflect.GetMember(mod, "manifest");
+                rows.Add(new ReplayLine("m")
+                    .Set("id", Reflect.GetString(manifest, "id"))
+                    .Set("version", Reflect.GetString(manifest, "version"))
+                    .SetFlag("affects_gameplay", Reflect.GetBool(manifest, "affectsGameplay", true))
+                    .Set("source", Reflect.GetMember(mod, "modSource")?.ToString()?.ToLowerInvariant()));
+            }
+            return rows;
+        }
+        catch { return null; }
+    }
+
+    private static List<string>? HarmonyOwners()
+    {
+        try
+        {
+            return HarmonyLib.Harmony.GetAllPatchedMethods()
+                .SelectMany(m => HarmonyLib.Harmony.GetPatchInfo(m)?.Owners
+                                 ?? (IEnumerable<string>)System.Array.Empty<string>())
+                .Distinct()
+                .OrderBy(o => o, System.StringComparer.Ordinal)
+                .ToList();
+        }
+        catch { return null; }
+    }
+
+    private static bool? FullConsole()
+    {
+        try
+        {
+            var saves = Reflect.GetStatic(
+                Core.HookPatcher.FindType("MegaCrit.Sts2.Core.Saves.SaveManager"), "Instance");
+            return Reflect.GetMember(Reflect.GetMember(saves, "SettingsSave"), "FullConsole") as bool?;
+        }
+        catch { return null; }
     }
 
     private static int Reloads()

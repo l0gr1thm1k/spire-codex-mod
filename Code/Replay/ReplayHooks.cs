@@ -420,6 +420,9 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.PatchOn(harmony,
             HookPatcher.FindType("MegaCrit.Sts2.Core.Models.MonsterModel"),
             "SetMoveImmediate", me, nameof(MoveSetImmediate), 2);
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.DevConsole.DevConsole"),
+            "ProcessCommand", me, nameof(ConsoleCommand), 3, firstParamType: "Player");
 
         _selectorProp = Reflect.StaticProperty(
             HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"), "Selector");
@@ -2555,6 +2558,19 @@ internal static class ReplayHooks
 
     private static void PotionUsed(object __2, object __3) => Potion("potion_used", __2, __3);
     private static void PotionStarting(object __2, object __3) => Potion("potion_start", __2, __3);
+
+    private static void ConsoleCommand(object? __0, string __1, string[] __2)
+    {
+        try
+        {
+            ReplayRecorder.Line("console")
+                ?.Set("cmd", __1)
+                .Set("args", __2 is { Length: > 0 } ? __2.ToList() : null)
+                .Set("mine", Mine(__0))
+                .Emit();
+        }
+        catch { }
+    }
     private static void PotionProcured(object __2) => Potion("potion_got", __2);
     private static void PotionDiscarded(object __2) => Potion("potion_dropped", __2);
 
