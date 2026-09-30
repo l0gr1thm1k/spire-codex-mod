@@ -331,7 +331,7 @@ public static class ReplayRecorder
             // The backend rejects a replay_version it has not shipped (400 bad_header against
             // KNOWN_REPLAY_VERSIONS), and on that path the mod marks the journal sent, so the
             // allowlist has to accept 6 before this ships.
-            ?.Set("replay_version", 6)
+            ?.Set("replay_version", 7)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
             // The .run records the bare version ("v0.111.0"); Sts2Version.Current carries the
