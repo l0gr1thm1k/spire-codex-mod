@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using HarmonyLib;
 using SpireCodex.Core;
 
@@ -137,6 +138,9 @@ internal static class ReplayHooks
         _selectDecision = 0;
         _selectDecisionType = null;
         _pendingTransforms.Clear();
+        _pendingRestOffer = null;
+        _restDecision = 0;
+        _restOptionIds = null;
     }
 
     // MerchantEntry.OnTryPurchaseWrapper(inventory, ignoreCost) — fires on the ATTEMPT, so the
@@ -410,8 +414,21 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionUsed", me, nameof(PotionUsed));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionProcured", me, nameof(PotionProcured));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionDiscarded", me, nameof(PotionDiscarded));
-        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRestSiteHeal", me, nameof(RestHeal));
-        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRestSiteSmith", me, nameof(RestSmith));
+        // The rest site. The game has hooks for only two of its nine options (AfterRestSiteHeal,
+        // AfterRestSiteSmith), and Heal's also fires for Mend's heal of a partner and for a
+        // mimicked heal, so the options are read off RestSiteOption itself: Generate for the
+        // offer, and OnSelect on every concrete option for the choice.
+        var restOption = HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.RestSite.RestSiteOption");
+        attempted++; n += HookPatcher.PatchOn(harmony, restOption, "Generate", me,
+                                              nameof(RestSiteGenerated), 1, postfix: true);
+        // OnSelect is abstract on the base, so Harmony has to patch each override. Enumerated
+        // from the game assembly rather than named, so an option added by a game patch is
+        // covered without a mod update; the count lands in the n/m line like any other patch.
+        foreach (var option in RestOptionTypes(restOption))
+        {
+            attempted++; n += HookPatcher.PatchOn(harmony, option, "OnSelect", me,
+                                                  nameof(RestOptionSelected), 0, postfix: true);
+        }
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Events.EventOption"),
                                  "Chosen", me, nameof(EventOptionChosen), 0);
 
@@ -536,6 +553,8 @@ internal static class ReplayHooks
             // the next room's resolutions would silently mis-attribute picks.
             DemoteDecision();
             _eventPage = null;
+            _restDecision = 0;
+            _restOptionIds = null;
             // An abandoned purchase never reaches AfterItemPurchased, so it would leave the
             // pending ware set for the rest of the run. RelicObtained reads that to tell a
             // relic off a shelf from one out of a decision, and a stale value would make it
@@ -561,6 +580,9 @@ internal static class ReplayHooks
                 .Set("id", Ids.Bare(Reflect.GetString(Reflect.GetMember(__1, "CanonicalEvent"), "Id"))
                            ?? Ids.Bare(Reflect.GetString(__1, "ModelId")))
                 .Emit();
+            // A rest site's offer was generated before this hook; it belongs after this row.
+            if (kind == "restsite") EmitRestOffer();
+            else _pendingRestOffer = null;
         }
         catch { }
     }
@@ -1873,14 +1895,121 @@ internal static class ReplayHooks
         catch { }
     }
 
-    private static void RestHeal()
+    // The concrete RestSiteOption types that declare their own OnSelect.
+    private static IEnumerable<Type> RestOptionTypes(Type? restOption)
     {
-        try { ReplayRecorder.Line("rest")?.Set("option", "heal").Emit(); } catch { }
+        if (restOption == null) return Array.Empty<Type>();
+        try
+        {
+            return restOption.Assembly.GetTypes()
+                .Where(t => !t.IsAbstract && t.IsSubclassOf(restOption)
+                            && t.GetMethod("OnSelect", BindingFlags.Public | BindingFlags.Instance
+                                                       | BindingFlags.DeclaredOnly) != null)
+                .ToList();
+        }
+        catch { return Array.Empty<Type>(); }
     }
 
-    private static void RestSmith()
+    // The local player's rest-site offer, from Generate, waiting for its room row. Generate runs
+    // in RestSiteRoom.EnterInternal BEFORE AfterRoomEntered, so writing it there would stamp the
+    // decision with the previous room's floor and put it ahead of its own `room` row.
+    private static List<object>? _pendingRestOffer;
+
+    // The rest decision and its option ids in offered order. Held apart from _decision because
+    // an option can open its own screen (Cook's removal opens a deck select), and the choice
+    // has to join to the rest decision, not to the screen it caused.
+    private static int _restDecision;
+    private static List<string>? _restOptionIds;
+
+    // RestSiteOption.Generate(Player) -> List<RestSiteOption>, postfix. Generated for every
+    // player in the room; only ours is an offer this journal records.
+    private static void RestSiteGenerated(object __0, object __result)
     {
-        try { ReplayRecorder.Line("rest")?.Set("option", "smith").Emit(); } catch { }
+        try
+        {
+            if (Mine(__0) == false) return;
+            _pendingRestOffer = Enumerate(__result).ToList();
+        }
+        catch { }
+    }
+
+    // Called from RoomEntered, after the room row. The offer is a real choice set, so it opens a
+    // decision like an event page does: its options' rows let a consumer see what was declined,
+    // and a disabled option (Smith with nothing to upgrade, Cook with fewer than two removable
+    // cards) says it was never available.
+    private static void EmitRestOffer()
+    {
+        var offer = _pendingRestOffer;
+        _pendingRestOffer = null;
+        if (offer == null || ReplayRecorder.Line("decision") is not { } line) return;
+        _decision = ReplayRecorder.NextDecisionId();
+        _decisionType = "rest_site";
+        _restDecision = _decision;
+        _restOptionIds = new List<string>();
+
+        var options = new List<ReplayLine>();
+        foreach (var o in offer)
+        {
+            var id = Reflect.GetString(o, "OptionId")?.ToLowerInvariant() ?? "unknown";
+            var enabled = Reflect.GetBool(o, "IsEnabled", true);
+            var row = new ReplayLine("o")
+                .Set("option_index", _restOptionIds.Count)
+                .Set("option_kind", "rest_option")
+                .Set("option_id", id)
+                .SetFlag("presented", true)
+                .SetFlag("selectable", enabled);
+            if (!enabled) row.Set("selectable_reason", "disabled");
+            options.Add(row);
+            _restOptionIds.Add(id);
+        }
+        line.Set("decision_id", _decision)
+            .Set("decision_type", _decisionType)
+            .Set("source", "rest_site")
+            .Set("n_presented", options.Count)
+            .Set("n_selectable", options.Count(o => o.Fields["selectable"] is true))
+            .Set("options", options)
+            .Emit();
+    }
+
+    // <Concrete>RestSiteOption.OnSelect() -> Task<bool>, postfix. The row is written when the
+    // task finishes, because the bool is whether the option STUCK: Smith returns false when the
+    // player backs out of its screen, and that option is still on offer afterwards.
+    // ExecuteSynchronously keeps the write on the thread that completed the task, which is the
+    // game's; Kindle returns an already-finished task, so it writes before OnSelect returns.
+    //
+    // Only heal and smith were recorded before, from the game's two rest hooks. Kindle is what
+    // made that costly: Pumpkin Candle grants +1 max energy while its KindleCount is above zero,
+    // and a Kindle is the only thing that refills it, so on RAGKTS0RWVX8 and EJK0NJAF7ZQJ an
+    // unrecorded Kindle at f24/f27 decided whether the player had the energy for every play in
+    // the f33 boss. The option is also written as what was chosen, not as the heal it caused:
+    // Mend's heal of a partner and a mimicked heal no longer read as a rest.
+    private static void RestOptionSelected(object __instance, Task<bool> __result)
+    {
+        try
+        {
+            var id = Reflect.GetString(__instance, "OptionId")?.ToLowerInvariant();
+            var owner = Reflect.GetMember(__instance, "Owner");
+            // A co-op partner's choice runs here too, and the recorded offer is ours, so their
+            // row names the option and joins to nothing.
+            var mine = Mine(owner);
+            var decision = mine == false ? 0 : _restDecision;
+            var index = mine == false ? -1 : _restOptionIds?.IndexOf(id ?? "") ?? -1;
+            __result?.ContinueWith(t =>
+            {
+                try
+                {
+                    if (t.Status != TaskStatus.RanToCompletion || !t.Result) return;
+                    ReplayRecorder.Line("rest")
+                        ?.Set("decision_id", decision > 0 ? decision : (int?)null)
+                        .Set("option", id)
+                        .Set("option_index", index >= 0 ? index : (int?)null)
+                        .Set("mine", mine)
+                        .Emit();
+                }
+                catch { }
+            }, TaskContinuationOptions.ExecuteSynchronously);
+        }
+        catch { }
     }
 
     // EventOption.Chosen(). The game gives us the option that WAS taken and no hook for the
