@@ -109,6 +109,12 @@ public static class ReplayJournalScan
                 card = MaxField(line, "from_c", card);
                 card = MaxField(line, "to_c", card);
                 card = MaxField(line, "instance_id", card);
+                // Card flow rows carry ids only inside arrays. A draw_order can mint ids for
+                // cards no later row names, so skipping these would reissue them.
+                card = MaxArray(line, "order_c", card);
+                card = MaxArray(line, "order_deck_c", card);
+                card = MaxArray(line, "flushed_c", card);
+                card = MaxArray(line, "retained_c", card);
                 decision = MaxField(line, "decision_id", decision);
                 // Every key that carries a creature id. The needle includes the leading quote,
                 // so "cid" cannot also match "target_cid" and each has to be named.
@@ -153,6 +159,27 @@ public static class ReplayJournalScan
             if (end > start && long.TryParse(line.Substring(start, end - start), out var v) && v > best)
                 best = v;
             at = line.IndexOf(needle, at + needle.Length, StringComparison.Ordinal);
+        }
+        return best;
+    }
+
+    // Highest integer inside "<key>":[...] anywhere in the line, or `best` when absent.
+    private static long MaxArray(string line, string key, long best)
+    {
+        var needle = "\"" + key + "\":[";
+        var at = line.IndexOf(needle, StringComparison.Ordinal);
+        while (at >= 0)
+        {
+            var i = at + needle.Length;
+            while (i < line.Length && line[i] != ']')
+            {
+                var start = i;
+                while (i < line.Length && char.IsDigit(line[i])) i++;
+                if (i > start && long.TryParse(line.Substring(start, i - start), out var v) && v > best)
+                    best = v;
+                if (i == start) i++;
+            }
+            at = line.IndexOf(needle, i, StringComparison.Ordinal);
         }
         return best;
     }

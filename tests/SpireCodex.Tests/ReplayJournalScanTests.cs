@@ -40,6 +40,23 @@ public sealed class ReplayJournalScanTests
     }
 
     [Fact]
+    public void RecoversCardIdsThatOnlyAppearInsideArrays()
+    {
+        // An undrawn card is named only by its slot in draw_order, so a scan that reads bare
+        // fields alone would hand its id to a different card after a reload.
+        var path = WriteJournal(
+            """{"t":"draw","s":0,"c":3,"deck_c":1}""",
+            """{"t":"draw_order","s":1,"order_c":[12,40,7],"order_deck_c":[2,1,3]}""",
+            """{"t":"flush","s":2,"flushed_c":[],"retained_c":[9]}""",
+            """{"t":"shuffle","s":3,"n_draw":2,"order_c":[5,6]}""");
+
+        var hw = ReplayJournalScan.HighWaterOf(path);
+        File.Delete(path);
+
+        Assert.Equal(40, hw.Card);
+    }
+
+    [Fact]
     public void ResumesTheCreatureIdFromEveryKeyThatCarriesOne()
     {
         // Creature ids arrive on six different keys and the highest wins, wherever it appeared.

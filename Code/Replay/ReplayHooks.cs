@@ -291,6 +291,27 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPowerAmountChanged", me, nameof(PowerChanged));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterBlockGained", me, nameof(BlockGained));
 
+        // --- card flow ---
+        // End of turn. FlushPlayerHand moves the hand with CardPileCmd.Add, which never reaches
+        // AfterCardDiscarded, so the flush and every retain were invisible. AfterFlush hands over
+        // both lists already split. Prefix: it is async and the lists are final before it runs.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterFlush", me, nameof(HandFlushed));
+        // The fight's opening draw order. A second prefix on BeforeCombatStart, registered after
+        // CombatStart's, so the row lands right behind combat_start at the same instant rng_state
+        // is stamped. Harmony runs same-priority prefixes in registration order.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeCombatStart", me, nameof(OpeningDrawOrder));
+        // Afflictions have no notification hook (ShouldAfflict is a veto). The non-generic
+        // Afflict is synchronous (Task.FromResult) and Afflict<T> delegates to it, so one postfix
+        // sees every applied affliction and its result. ClearAffliction is a plain void.
+        var cardCmd = HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd");
+        attempted++; n += HookPatcher.PatchOn(harmony, cardCmd, "Afflict", me, nameof(CardAfflicted), 3,
+                                 firstParamType: "AfflictionModel", postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony, cardCmd, "ClearAffliction", me, nameof(AfflictionCleared), 1,
+                                 firstParamType: "CardModel");
+        // Hook.ShouldPlay refusals on the autoplay path. Postfix so the out preventer is set.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "ShouldPlay", me, nameof(PlayRefused), postfix: true);
+        _autoPlayType = HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Cards.AutoPlayType");
+
         // --- block loss --------------------------------------------------------------
         // Block only ever went UP in the journal: 34531 gain rows and not one row anywhere that
         // removed any of it, so a consumer summing them got a level that never reset and "how
@@ -1568,6 +1589,143 @@ internal static class ReplayHooks
                 // Omitted, not zeroed, on a failed read: a shuffle cannot leave an empty draw pile,
                 // so a 0 here would be a number the game never produces presented as data.
                 .Set("n_draw", cards == null ? (int?)null : Enumerate(cards).Count())
+                // card flow (D4): the order the shuffle produced, top first. See PileOrder.
+                .Set("order_c", PileOrder(cards))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // --- card flow -------------------------------------------------------------------
+
+    // Resolved at install; names the autoplay kind on play_blocked. Null leaves auto_type off.
+    private static Type? _autoPlayType;
+
+    // Instance ids of a card sequence in its own order, or null when it could not be read.
+    // For a draw pile index 0 is the top: CardPileCmd.Draw takes Cards.FirstOrDefault().
+    //
+    // Shuffle order comes from the pile itself rather than a Hook.ModifyShuffleOrder postfix.
+    // That hook is sync and edits a list CardPileCmd.Shuffle then re-adds to the emptied draw
+    // pile one by one in that order, so by AfterShuffle the pile IS that list, plus the debug
+    // forced top card the list never shows.
+    private static List<int>? PileOrder(object? cards)
+        => cards is IEnumerable ? Enumerate(cards).Select(CardInstances.Of).ToList() : null;
+
+    // Hook.AfterFlush(ICombatState, Player, PlayerChoiceContext, flushedCards, retainedCards).
+    // Written even when both are empty: an empty list is an answer, a missing field is not.
+    private static void HandFlushed(object __1, object __3, object __4)
+    {
+        try
+        {
+            ReplayRecorder.Line("flush")
+                ?.Set("mine", Mine(__1))
+                .Set("flushed_c", PileOrder(__3))
+                .Set("retained_c", PileOrder(__4))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Hook.BeforeCombatStart(IRunState, ICombatState?). The initial shuffle ran back in
+    // SetUpCombat (Player.PopulateCombatState -> RandomizeOrderInternal -> ModifyShuffleOrder),
+    // so the draw pile here is its output. Turn 1 then moves Innate cards to the top and
+    // bottom-start enchantments down, which the deal's draw rows show.
+    //
+    // order_deck_c pairs each position with its deck card: undrawn cards otherwise never
+    // name their deck origin anywhere. Dropped whole if any entry has none, so it never
+    // carries a 0 posing as an id.
+    private static void OpeningDrawOrder(object __1)
+    {
+        try
+        {
+            var players = Enumerate(Reflect.GetMember(__1, "Players")).ToList();
+            var me = players.FirstOrDefault(p => LocalPlayer.IsLocalPlayer(p))
+                     ?? (players.Count == 1 ? players[0] : null);
+            if (me == null) return;
+            var cards = Reflect.GetMember(
+                Reflect.GetMember(Reflect.GetMember(me, "PlayerCombatState"), "DrawPile"), "Cards");
+            var order = PileOrder(cards);
+            if (order == null) return;
+            var deck = Enumerate(cards).Select(CardInstances.DeckIdOf).ToList();
+            ReplayRecorder.Line("draw_order")
+                ?.Set("order_c", order)
+                .Set("order_deck_c", deck.Contains(0) ? null : deck)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CardCmd.Afflict(AfflictionModel affliction, CardModel card, decimal amount), postfix.
+    // A null result is a refusal (ShouldAfflict, CanAfflict, combat ending) and writes nothing.
+    // On a stack the returned model is the card's existing one, so amount_total is the sum.
+    private static void CardAfflicted(object __1, decimal __2, object? __result)
+    {
+        try
+        {
+            if (__result is not System.Threading.Tasks.Task { IsCompletedSuccessfully: true } done) return;
+            var applied = Reflect.GetMember(done, "Result");
+            if (applied == null || __1 == null) return;
+            var origin = CardInstances.DeckIdOf(__1);
+            ReplayRecorder.Line("afflict")
+                ?.Set("c", CardInstances.Of(__1))
+                .Set("deck_c", origin > 0 ? origin : (int?)null)
+                .Set("id", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Set("affliction", Ids.Bare(Reflect.GetString(applied, "Id")))
+                // The game truncates the same way when it stores it.
+                .Set("amount", (int)__2)
+                .Set("amount_total", Reflect.GetMember(applied, "Amount") as int?)
+                .Set("mine", Mine(Reflect.GetMember(__1, "Owner")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CardCmd.ClearAffliction(CardModel card), prefix, so the affliction is still readable.
+    // Callers often clear without checking, and that no-op writes nothing.
+    private static void AfflictionCleared(object __0)
+    {
+        try
+        {
+            var affliction = Reflect.GetMember(__0, "Affliction");
+            if (affliction == null) return;
+            var origin = CardInstances.DeckIdOf(__0);
+            ReplayRecorder.Line("unafflict")
+                ?.Set("c", CardInstances.Of(__0))
+                .Set("deck_c", origin > 0 ? origin : (int?)null)
+                .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Set("affliction", Ids.Bare(Reflect.GetString(affliction, "Id")))
+                .Set("amount", Reflect.GetMember(affliction, "Amount") as int?)
+                .Set("mine", Mine(Reflect.GetMember(__0, "Owner")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Hook.ShouldPlay(ICombatState, CardModel card, out AbstractModel? preventer, AutoPlayType).
+    //
+    // CardModel.CanPlay calls this every frame for UI glow, always with AutoPlayType.None
+    // (enum value 0), and CardCmd.AutoPlay is the only caller passing anything else. So a
+    // refusal with a non-None type is an autoplay the game then routes to
+    // MoveToResultPileWithoutPlaying with no play row. `int __3` binds the enum without boxing
+    // and `object __2` reads the out value (Harmony derefs a by-ref arg for a by-value param).
+    //
+    // The manual path is not covered: PlayCardAction re-checks CanPlay after an await and
+    // cancels, which leaves the card in hand with nothing spent, and CanPlay itself is too hot
+    // to tell that check apart from UI polling.
+    private static void PlayRefused(bool __result, object __1, object? __2, int __3)
+    {
+        if (__result || __3 == 0) return;
+        try
+        {
+            var origin = CardInstances.DeckIdOf(__1);
+            var kind = _autoPlayType == null ? null : Enum.GetName(_autoPlayType, __3);
+            ReplayRecorder.Line("play_blocked")
+                ?.Set("c", CardInstances.Of(__1))
+                .Set("deck_c", origin > 0 ? origin : (int?)null)
+                .Set("id", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Set("preventer", Ids.Bare(Reflect.GetString(__2, "Id")))
+                .Set("auto_type", kind?.ToLowerInvariant())
+                .Set("mine", Mine(Reflect.GetMember(__1, "Owner")))
                 .Emit();
         }
         catch { }
