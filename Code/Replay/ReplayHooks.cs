@@ -62,6 +62,8 @@ internal static class ReplayHooks
     // Named because CardEnchanted has to tell an enchant offer from any other open select
     // before it joins to one.
     private const string EnchantSelectType = "deck_select_enchant";
+    private const string TransformSelectType = "deck_select_transform";
+    private const string UpgradeSelectType = "deck_select_upgrade";
 
     // Bumped by CardReward.Reroll and consumed by the Populate that follows it, so a rerolled
     // offer keeps its decision and increments offer_generation. The earlier version minted a
@@ -3949,9 +3951,14 @@ internal static class ReplayHooks
             // The deck listing must re-read: this changes card state without
             // changing membership, which the deck signature cannot see.
             ReplayRecorder.MarkDeckChanged();
+            // Same gate as transform. An upgrade from a relic, a potion, Armaments or the dev
+            // console claimed whichever select was open: a console upgrade during New Leaf's
+            // transform select wrote option_index 0 of that select.
+            var offered = _decisionType == UpgradeSelectType;
             ReplayRecorder.Line("upgrade")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
-                .Set("option_index", SelectIndexOf(__0))
+                ?.Set("decision_id", _decision > 0 && (offered || _decisionType is "event" or "rest")
+                    ? _decision : (int?)null)
+                .Set("option_index", offered ? SelectIndexOf(__0) : null)
                 .Set("c", CardInstances.Of(__0))
                 .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
                 .Emit();
@@ -4044,11 +4051,19 @@ internal static class ReplayHooks
         _transformFrom = null;
         try
         {
+            // Join ONLY to a transform select, the same rule CardEnchanted keeps. A transform
+            // also runs from relics on pickup (Leafy Poultice, Pandora's Box, Archaic Tooth) and
+            // from TransformToRandom, and a removal, enchant or upgrade select can still be open
+            // when it does. An ungated lookup handed that select an option_index and registered
+            // a pick the player never made in its outcome row. An event or a rest option (Hatch)
+            // that transforms still owns its decision_id, with no option_index to claim.
+            var offered = _decisionType == TransformSelectType;
             ReplayRecorder.Line("transform")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
+                ?.Set("decision_id", _decision > 0 && (offered || _decisionType is "event" or "rest")
+                    ? _decision : (int?)null)
                 // The option index belongs to the card that was CHOSEN, which is the one that
                 // was on offer; the replacement was never in the deck when the select opened.
-                .Set("option_index", SelectIndexOf(from))
+                .Set("option_index", offered ? SelectIndexOf(from) : null)
                 // Explicitly null rather than CardInstances.Of(null), which is the 0 sentinel and
                 // would read downstream as a real instance id.
                 .Set("from_c", from == null ? (int?)null : CardInstances.Of(from))
