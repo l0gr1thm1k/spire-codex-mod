@@ -631,6 +631,9 @@ internal static class ReplayHooks
         // marker, so the pair it produces is readable as one swap rather than two coincidences.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
                                  "Replace", me, nameof(RelicReplacing), 2);
+        // A potion's effects land between these two. potion_used alone comes AFTER them, so
+        // a row it caused could not be told from a row nothing caused.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforePotionUsed", me, nameof(PotionStarting));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionUsed", me, nameof(PotionUsed));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionProcured", me, nameof(PotionProcured));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionDiscarded", me, nameof(PotionDiscarded));
@@ -4217,6 +4220,13 @@ internal static class ReplayHooks
     // and not which body, and the `hit` rows it causes name no potion to join back on.
     // AfterPotionProcured and AfterPotionDiscarded have no target argument at all.
     private static void PotionUsed(object __2, object __3) => Potion("potion_used", __2, __3);
+
+    // Hook.BeforePotionUsed(IRunState, ICombatState?, PotionModel potion, Creature? target).
+    // PotionModel.OnUseWrapper calls it before OnUse, so this row opens the potion's effects and
+    // potion_used closes them. Without it a potion was recorded only by its consequences: its
+    // block, power and hit rows came first and the potion_used marker after, so a cardless block
+    // row read the same whether a potion had caused it or nothing in the journal had.
+    private static void PotionStarting(object __2, object __3) => Potion("potion_start", __2, __3);
     private static void PotionProcured(object __2) => Potion("potion_got", __2);
     private static void PotionDiscarded(object __2) => Potion("potion_dropped", __2);
 
