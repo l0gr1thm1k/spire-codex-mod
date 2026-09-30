@@ -608,6 +608,26 @@ internal static class ReplayHooks
         // on the loss path as well as the win. See BindCombatEndEvents.
         BindCombatEndEvents();
 
+        // --- creatures ---------------------------------------------------------------
+        // Mid-fight arrivals. CombatManager.AfterCreatureAdded rather than
+        // Hook.AfterCreatureAddedToCombat: the hook fires after Creature.AfterAddedToRoom, where
+        // monsters apply their entry powers (Tough Egg's Hatch), so the power row would beat the
+        // roster row. Osty and relic pets arrive here too, through PlayerCmd.AddPet.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.CombatManager"),
+            "AfterCreatureAdded", me, nameof(CreatureAdded), 1);
+        // Escape fires no hook. CreatureCmd.Escape has early returns, CreatureEscaped is only
+        // reached once the body really leaves.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.CombatState"),
+            "CreatureEscaped", me, nameof(CreatureEscaped), 1);
+        // Doom kills already write death rows (DoomKill calls CreatureCmd.Kill). These two
+        // bracket the kill so CreatureDied can name the cause.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.Powers.DoomPower"),
+            "DoomKill", me, nameof(DoomKillStarting), 1);
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDiedToDoom", me, nameof(DoomKillDone));
+
         // Not Harmony patches, so deliberately outside the n/attempted tally: these are plain
         // member lookups whose absence costs two fields on one row, not a whole line kind.
         // The Player argument for the overload match comes from the first pick, so IsMe
@@ -921,6 +941,7 @@ internal static class ReplayHooks
             // an unconsumed extra-turn mark behind for a later one to read.
             _combatWon = false;
             _extraTurnPending = null;
+            _doomed.Clear(); // creatures: a DoomKill that never reached AfterDiedToDoom
 
             var line = ReplayRecorder.Line("combat_start");
             if (line == null) return;
@@ -947,23 +968,20 @@ internal static class ReplayHooks
             var enemies = new List<ReplayLine>();
             var i = 0;
             foreach (var e in Enumerate(Reflect.GetMember(__1, "Enemies")))
+                // `i` keeps the meaning it has always had: this enemy's POSITION in the list,
+                // 0..n-1, left to right. Unchanged, because released readers already parse it.
+                enemies.Add(CreatureEntry(new ReplayLine("e").Set("i", i++), e));
+
+            // Non-player allies present at the start, in their own key so `enemies` reads as
+            // before. Usually empty: Osty and relic pets are added by BeforeCombatStart
+            // listeners, after this prefix, and get a spawn row. Omitted only if unreadable.
+            List<ReplayLine>? allies = null;
+            if (Reflect.GetMember(__1, "Allies") is IEnumerable allySeq)
             {
-                enemies.Add(new ReplayLine("e")
-                    // `i` keeps the meaning it has always had: this enemy's POSITION in the list,
-                    // 0..n-1, left to right. Unchanged, because released readers already parse it.
-                    .Set("i", i++)
-                    // `cid` is the body's identity, and is what every `*_cid` elsewhere refers to.
-                    // Deliberately not the same thing as `i`: position is per fight and shifts as
-                    // enemies die, identity is per run and never moves.
-                    .Set("cid", CreatureSlots.Maybe(e))
-                    .Set("id", Ids.Bare(Reflect.GetString(e, "ModelId")))
-                    // The game's OWN name for this position, when the encounter defines one (only
-                    // 19 of 98 do). Absent everywhere else, so it cannot serve as the identity --
-                    // but where present it ties `cid` to what the player sees on screen, and is
-                    // how a consumer can check the two agree.
-                    .Set("slot", Reflect.GetString(e, "SlotName"))
-                    .Set("hp", Reflect.GetInt(e, "CurrentHp", 0))
-                    .Set("max_hp", Reflect.GetInt(e, "MaxHp", 0)));
+                allies = new List<ReplayLine>();
+                foreach (var a in Enumerate(allySeq))
+                    if (Reflect.GetMember(a, "IsPlayer") is false)
+                        allies.Add(CreatureEntry(new ReplayLine("a"), a));
             }
             line.Set("combat_id", _combatId)
                 .Set("attempt_id", ReplayRecorder.AttemptId)
@@ -977,6 +995,7 @@ internal static class ReplayHooks
                 // replaying every fight before it.
                 .Set("rng_state", RngState.Read())
                 .Set("enemies", enemies)
+                .Set("allies", allies)
                 .Emit();
         }
         catch { }
@@ -1158,6 +1177,8 @@ internal static class ReplayHooks
                 // is still standing. `false` is a body that really left. A dropped false would
                 // read as "really died", which is the wrong half to guess.
                 .SetFlag("removal_prevented", __3)
+                // creatures: only ever "doom" today. Absent means no known special cause.
+                .Set("cause", _doomed.Contains(__2) ? "doom" : null)
                 .Emit();
         }
         catch { }
@@ -3306,6 +3327,86 @@ internal static class ReplayHooks
         var actIndex = Reflect.GetInt(runState, "CurrentActIndex", -1);
         if (floor < 0 || actIndex < 0) return;
         line.Set("floor", floor).Set("act", actIndex + 1);
+    }
+
+    // --- creatures -------------------------------------------------------------------
+
+    // One creature's roster fields, shared by combat_start (enemies, allies) and spawn so the
+    // shapes cannot drift. Strict reads: an unreadable hp is omitted, never 0.
+    private static ReplayLine CreatureEntry(ReplayLine row, object c)
+        // `cid` is the body's identity, what every `*_cid` elsewhere refers to. Not the same as
+        // `i`: position is per fight and shifts, identity is per run and never moves.
+        => row.Set("cid", CreatureSlots.Maybe(c))
+            .Set("id", Ids.Bare(Reflect.GetString(c, "ModelId")))
+            // The game's own name for the position, where the encounter defines one (19 of 98).
+            .Set("slot", Reflect.GetString(c, "SlotName"))
+            .Set("hp", HpOf(c, "CurrentHp"))
+            .Set("max_hp", HpOf(c, "MaxHp"));
+
+    // CombatManager.AfterCreatureAdded(Creature). Starting creatures pass through here too,
+    // from StartCombatInternal before IsInProgress flips, and combat_start declares those.
+    // CreatureCmd.Add throws unless IsInProgress, so true here means a mid-fight arrival.
+    // PREFIX: the method is async and the entry powers are applied inside it.
+    private static void CreatureAdded(object __instance, object __0)
+    {
+        try
+        {
+            if (Reflect.GetMember(__instance, "IsInProgress") is not true) return;
+            if (ReplayRecorder.Line("spawn") is not { } line) return;
+            // hp is as created. Osty is added at its model default and then set by SetMaxHp
+            // and Heal, which write their own max_hp and hp rows right after this one.
+            CreatureEntry(line, __0)
+                .Set("side", Reflect.GetMember(__0, "Side")?.ToString() switch
+                {
+                    "Enemy" => "enemy",
+                    "Player" => "ally",
+                    _ => null,
+                })
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CombatState.CreatureEscaped(Creature). Only reached from CreatureCmd.Escape once its
+    // guards pass (Fat Gremlin, Thieving Hopper, Battleworn Dummy). The power_lost rows from
+    // Escape's power sweep land just before this row.
+    private static void CreatureEscaped(object __0)
+    {
+        try
+        {
+            ReplayRecorder.Line("escape")
+                ?.Set("tgt", CreatureRef(__0))
+                .Set("tgt_cid", CreatureSlots.Maybe(__0))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Bodies inside a DoomKill, by reference. Set in its prefix (before any Kill runs) and
+    // cleared by Hook.AfterDiedToDoom, which DoomKill awaits after the last Kill, so a doomed
+    // body that was revived and dies later to a Strike is not blamed on Doom.
+    private static readonly HashSet<object> _doomed = new(ReferenceEqualityComparer.Instance);
+
+    // DoomPower.DoomKill(IReadOnlyList<Creature>), static. PREFIX: async, and the deaths
+    // happen inside it.
+    private static void DoomKillStarting(object __0)
+    {
+        try
+        {
+            foreach (var c in Enumerate(__0)) _doomed.Add(c);
+        }
+        catch { }
+    }
+
+    // Hook.AfterDiedToDoom(ICombatState, IReadOnlyList<Creature>). PREFIX so the marks are gone
+    // before any listener can kill again.
+    private static void DoomKillDone(object __1)
+    {
+        try
+        {
+            foreach (var c in Enumerate(__1)) _doomed.Remove(c);
+        }
+        catch { }
     }
 
     // --- helpers ---------------------------------------------------------------------
