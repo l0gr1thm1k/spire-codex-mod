@@ -136,6 +136,7 @@ internal static class ReplayHooks
         _selected = null;
         _selectDecision = 0;
         _selectDecisionType = null;
+        _pendingTransforms.Clear();
     }
 
     // MerchantEntry.OnTryPurchaseWrapper(inventory, ignoreCost) — fires on the ATTEMPT, so the
@@ -353,8 +354,21 @@ internal static class ReplayHooks
         // Deck mutations that instance lineage depends on.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
                                  "Upgrade", me, nameof(CardUpgraded), 2, firstParamType: "CardModel");
-        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
-                                 "Transform", me, nameof(CardTransformed), 3, firstParamType: "CardModel");
+        // Transform is read in three places because no single point in the game holds both
+        // cards in their final form. CardCmd has four entry points (Transform with an explicit
+        // replacement, TransformTo<T>, TransformToRandom, and the batch Transform they all
+        // delegate to), and a relic or event's random transform names its replacement only
+        // inside the batch loop. GetReplacement is where each pair is first known; a deck
+        // modifier (the Eggs, Fresnel Lens) may then CLONE the replacement, so the pair is
+        // re-pointed at the clone; and AfterTransformedTo fires on the card that actually
+        // landed, which is when the row is written.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Cards.CardTransformation"),
+            "GetReplacement", me, nameof(TransformPaired), 1, postfix: true);
+        attempted++; n += HookPatcher.Patch(harmony, hook, "ModifyCardBeingAddedToDeck", me,
+                                            nameof(TransformReplacementModified), postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Models.CardModel"),
+                                 "AfterTransformedTo", me, nameof(CardTransformed), 0, postfix: true);
         // Enchantment has no hook at all: Hook.cs names Enchantment only to read damage and
         // block modifiers. CardCmd.Enchant is the patch point instead, and it is the right one
         // on three counts. It is SYNCHRONOUS, returning EnchantmentModel? rather than a Task,
@@ -1596,21 +1610,78 @@ internal static class ReplayHooks
         return (type ?? "unknown").ToLowerInvariant();
     }
 
-    // Transform genuinely swaps objects, so this is the one place the lineage thread would
-    // break. Both are in scope here, so the link is explicit.
-    private static void CardTransformed(object __0, object __1)
+    // Transforms whose replacement is known but has not landed yet: (original, replacement,
+    // the pile the original was in). Populated by GetReplacement and drained by
+    // AfterTransformedTo within the same CardCmd.Transform call, so it is normally empty
+    // between calls. A batch can hold several pairs at once (Morphic Grove transforms two).
+    private static readonly List<(object From, object To, string Pile)> _pendingTransforms = new();
+
+    // CardTransformation.GetReplacement(Rng? rng) -> CardModel?. Postfix, so __result is the
+    // replacement whether the caller named it or the rng rolled it. The original is still in
+    // its pile here -- CardCmd.Transform removes it on the next line -- so its pile is too.
+    private static void TransformPaired(object __instance, object? __result)
     {
         try
         {
+            if (__result == null) return; // the game throws on this path; nothing lands
+            var original = Reflect.GetMember(__instance, "Original");
+            if (original == null) return;
+            _pendingTransforms.Add((original, __result, PileName(original)));
+        }
+        catch { }
+    }
+
+    // Hook.ModifyCardBeingAddedToDeck(runState, card, out modifyingModels) -> CardModel.
+    // Frozen, Molten and Toxic Egg and Fresnel Lens answer with a CLONE of the card, and the
+    // clone is what enters the deck. Re-point a pending pair at it; any other deck add has no
+    // pending pair and falls through.
+    private static void TransformReplacementModified(object __1, object __result)
+    {
+        try
+        {
+            if (ReferenceEquals(__1, __result)) return;
+            for (var i = 0; i < _pendingTransforms.Count; i++)
+                if (ReferenceEquals(_pendingTransforms[i].To, __1))
+                    _pendingTransforms[i] = (_pendingTransforms[i].From, __result, _pendingTransforms[i].Pile);
+        }
+        catch { }
+    }
+
+    // CardModel.AfterTransformedTo(), postfix, on the card that landed. No card type overrides
+    // it, so the base patch fires for every transform.
+    //
+    // Transform genuinely swaps objects, so this is the one place the lineage thread would
+    // break. It used to be read from a prefix on Transform(original, replacement), which only
+    // the explicit-replacement callers reach: TransformToRandom goes straight to the batch
+    // overload, so New Leaf, Morphic Grove and Aroma of Chaos wrote no row at all, and a
+    // transform into a deck holding an Egg named the replacement the Egg then discarded.
+    private static void CardTransformed(object __instance)
+    {
+        try
+        {
+            var i = _pendingTransforms.FindIndex(p => ReferenceEquals(p.To, __instance));
+            if (i < 0) return;
+            var (from, _, pile) = _pendingTransforms[i];
+            _pendingTransforms.RemoveAt(i);
+            // Join ONLY to a transform offer or an event, the same rule the enchant row keeps.
+            // New Leaf's screen (FromDeckForTransformation) is not a recorded offer, so whatever
+            // select was open before it is still open when its transform lands -- measured: Neow's
+            // enchant screen, which the New Leaf transform then claimed option 3 of.
+            var transformOffer = _decisionType == "deck_select_transform";
+            var optionIndex = transformOffer ? SelectIndexOf(from) : null;
             ReplayRecorder.Line("transform")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
+                ?.Set("decision_id",
+                      (transformOffer || _decisionType == "event") && _decision > 0
+                          ? _decision : (int?)null)
                 // The option index belongs to the card that was CHOSEN, which is the one that
                 // was on offer; the replacement was never in the deck when the select opened.
-                .Set("option_index", SelectIndexOf(__0))
-                .Set("from_c", CardInstances.Of(__0))
-                .Set("from_id", Ids.Bare(Reflect.GetString(__0, "Id")))
-                .Set("to_c", CardInstances.Of(__1))
-                .Set("to_id", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Set("option_index", optionIndex)
+                .Set("from_c", CardInstances.Of(from))
+                .Set("from_id", Ids.Bare(Reflect.GetString(from, "Id")))
+                .Set("to_c", CardInstances.Of(__instance))
+                .Set("to_id", Ids.Bare(Reflect.GetString(__instance, "Id")))
+                // "deck" is a run-level change; a combat pile means the swap lasts one fight.
+                .Set("pile", pile)
                 .Emit();
         }
         catch { }
