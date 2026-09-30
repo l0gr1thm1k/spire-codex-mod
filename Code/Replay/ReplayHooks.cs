@@ -153,6 +153,9 @@ internal static class ReplayHooks
         _eventPageIndex = -1;
         _eventId = null;
         ResetAttacks(); // attacks
+        // offers
+        _pendingDeckKind = null;
+        _treasureOfferIds = null;
     }
 
     // MerchantEntry.OnTryPurchaseWrapper(inventory, ignoreCost) — fires on the ATTEMPT, so the
@@ -690,6 +693,32 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterModifyingHpLostBeforeOsty", me, nameof(HpLossModified));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterModifyingHpLostAfterOsty", me, nameof(HpLossModified));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterModifyingBlockAmount", me, nameof(BlockModified));
+        // --- offers ---
+        //
+        // The dedicated upgrade and transform screens never reach FromDeckGeneric, so the Smith
+        // and 15 other call sites wrote a pick with no offer. Prefix: both are async Task.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"),
+                                 "FromDeckForUpgrade", me, nameof(UpgradeSelectOffered), 2);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"),
+                                 "FromDeckForTransformation", me, nameof(TransformSelectOffered), 3);
+        // FromDeckForRemoval delegates to FromDeckGeneric synchronously, so a latch set here is
+        // read by DeckSelectOffered inside the same call. The postfix clears it if that never ran.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"),
+                                 "FromDeckForRemoval", me, nameof(RemovalSelectEntering), 3);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardSelectCmd"),
+                                 "FromDeckForRemoval", me, nameof(RemovalSelectLeft), 3, postfix: true);
+        // Treasure chests bypass RewardsCmd entirely. BeginRelicPicking is a plain void, so its
+        // postfix sees CurrentRelics built. OnPicked is a prefix because it nulls CurrentRelics
+        // on the award path.
+        var treasureSync = HookPatcher.FindType("MegaCrit.Sts2.Core.Multiplayer.Game.TreasureRoomRelicSynchronizer");
+        attempted++; n += HookPatcher.PatchOn(harmony, treasureSync, "BeginRelicPicking", me, nameof(TreasureOffered), 0, postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony, treasureSync, "OnPicked", me, nameof(TreasurePicked), 2);
+        attempted++; n += HookPatcher.PatchOn(harmony, treasureSync, "CompleteWithNoRelics", me, nameof(TreasureEmpty), 0);
+        // Relic rewards. OnSelect is a prefix so the offer row lands before the relic row that
+        // Obtain writes inside it. OnSkipped is the RelicReward override, a plain void.
+        var relicReward = HookPatcher.FindType("MegaCrit.Sts2.Core.Rewards.RelicReward");
+        attempted++; n += HookPatcher.PatchOn(harmony, relicReward, "OnSelect", me, nameof(RelicRewardSelecting), 0);
+        attempted++; n += HookPatcher.PatchOn(harmony, relicReward, "OnSkipped", me, nameof(RelicRewardSkipped), 0);
 
         // --- combat lifecycle --------------------------------------------------------
         // An extra turn shares its ROUND with the turn it extends: CombatManager.SwitchSides
@@ -3219,7 +3248,13 @@ internal static class ReplayHooks
         try
         {
             var deck = Reflect.GetMember(Reflect.GetMember(__0, "Deck"), "Cards");
-            OpenSelectOffer("deck_select", SelectKind(__1), __0, __1, Enumerate(deck), __2)?.Emit();
+            // offers: the removal entry point outranks a prompt SelectKind cannot read, and a
+            // kind still unknown carries its loc key so the screen stays identifiable.
+            var kind = _pendingDeckKind ?? SelectKind(__1);
+            _pendingDeckKind = null;
+            OpenSelectOffer("deck_select", kind, __0, __1, Enumerate(deck), __2)
+                ?.Set("prompt_key", kind == "unknown" ? PromptKey(__1) : null)
+                .Emit();
         }
         catch { }
     }
@@ -3505,7 +3540,9 @@ internal static class ReplayHooks
             var kind = __2.GetType().Name;
             var line = ReplayRecorder.Line("resolve");
             if (line == null) return;
-            line.Set("decision_id", _decision > 0 ? _decision : (int?)null)
+            // offers: a relic reward names its own decision, never the card reward open beside it.
+            line.Set("decision_id", kind == "RelicReward" ? RelicRewardDecision(__2, mint: false)
+                                    : _decision > 0 ? _decision : (int?)null)
                 .Set("reward_kind", kind);
             switch (kind)
             {
@@ -3514,6 +3551,9 @@ internal static class ReplayHooks
                     break;
                 case "GoldReward":
                     line.Set("gold", Reflect.GetInt(__2, "Amount", 0));
+                    break;
+                case "RelicReward":
+                    line.Set("id", Ids.Bare(Reflect.GetString(Reflect.GetMember(__2, "Relic"), "Id")));
                     break;
             }
             line.Emit();
@@ -3736,7 +3776,8 @@ internal static class ReplayHooks
             // there is no decision for such a relic to belong to and omitting is correct.
             // Deciding on the open decision's TYPE asks the right question: not how the relic
             // arrived, but whether the thing waiting for an answer could produce one at all.
-            var grantable = _decisionType is "event" or "rest";
+            var grantable = _decisionType is "event" or "rest"
+                || _decisionType == TreasureType && _treasureOfferIds?.Contains(Ids.Bare(Reflect.GetString(__0, "Id")) ?? "") == true;
             ReplayRecorder.Line("relic")
                 ?.Set("decision_id",
                       !fromShelf && grantable && _decision > 0 ? _decision : (int?)null)
@@ -4050,6 +4091,198 @@ internal static class ReplayHooks
                 .Set("decision_id", _decisionType is "event" or "rest" && _decision > 0
                                         ? _decision : (int?)null)
                 .Set("mine", Mine(owner))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // --- offers --------------------------------------------------------------------
+
+    // Set by the FromDeckForRemoval prefix and read by DeckSelectOffered in the same call. The
+    // combat-reward removal and every relic-prompted removal carry a loc key that SelectKind
+    // cannot read ("COMBAT_REWARD_CARD_REMOVAL..."), which is where 34 of the corpus's 37
+    // deck_select_unknown offers came from. The entry point is what makes it a removal.
+    private static string? _pendingDeckKind;
+
+    private static void RemovalSelectEntering() => _pendingDeckKind = "remove";
+    private static void RemovalSelectLeft() => _pendingDeckKind = null;
+
+    private static string? PromptKey(object? prefs)
+        => Reflect.GetString(Reflect.GetMember(prefs, "Prompt"), "LocEntryKey");
+
+    // FromDeckForUpgrade(player, prefs). The presented set is rebuilt the way the game builds
+    // it (deck cards with IsUpgradable), read strictly so a renamed member empties the offer
+    // instead of presenting cards the screen never showed. An empty set shows no screen and
+    // logs no choice, so it records nothing.
+    private static void UpgradeSelectOffered(object __0, object __1)
+    {
+        try
+        {
+            var cards = DeckCards(__0).Where(c => Reflect.GetMember(c, "IsUpgradable") is true).ToList();
+            if (cards.Count == 0) return;
+            OpenSelectOffer("deck_select", "upgrade", __0, __1, cards, filter: null)?.Emit();
+        }
+        catch { }
+    }
+
+    // FromDeckForTransformation(player, prefs, cardToTransformation). Same idea: the game shows
+    // deck cards that are transformable and not Quest cards. Claws opens this with its own relic
+    // prompt, so the kind comes from the entry point rather than SelectKind.
+    private static void TransformSelectOffered(object __0, object __1)
+    {
+        try
+        {
+            var cards = DeckCards(__0).Where(c =>
+                Reflect.GetMember(c, "IsTransformable") is true
+                && Reflect.GetMember(c, "Type") is { } t && t.ToString() != "Quest").ToList();
+            if (cards.Count == 0) return;
+            OpenSelectOffer("deck_select", "transform", __0, __1, cards, filter: null)?.Emit();
+        }
+        catch { }
+    }
+
+    private static IEnumerable<object> DeckCards(object? player)
+        => Enumerate(Reflect.GetMember(Reflect.GetMember(player, "Deck"), "Cards"));
+
+    // The treasure decision's decision_type, and the relic ids its chest offered. RelicObtained
+    // joins a relic to it only when the relic is one of those, so a relic from the room's extra
+    // rewards cannot claim the chest. By id because the award obtains a ToMutable() clone.
+    private const string TreasureType = "treasure";
+    private static HashSet<string>? _treasureOfferIds;
+
+    // BeginRelicPicking postfix. One relic per player that gets treasure, so single-player is
+    // one relic plus skip. An empty chest is left to TreasureEmpty, which is the game's own
+    // positive signal for it rather than a null list that a renamed member would also produce.
+    private static void TreasureOffered(object __instance)
+    {
+        try
+        {
+            var relics = Enumerate(Reflect.GetMember(__instance, "CurrentRelics")).ToList();
+            if (relics.Count == 0) return;
+            if (ReplayRecorder.Line("decision") is not { } line) return;
+            DemoteDecision();
+            _decision = ReplayRecorder.NextDecisionId();
+            _decisionType = TreasureType;
+            _treasureOfferIds = new HashSet<string>();
+
+            var options = new List<ReplayLine>();
+            for (var i = 0; i < relics.Count; i++)
+            {
+                var id = Ids.Bare(Reflect.GetString(relics[i], "Id"));
+                if (id != null) _treasureOfferIds.Add(id);
+                options.Add(new ReplayLine("o")
+                    .Set("option_index", i)
+                    .Set("option_kind", "relic")
+                    .Set("option_id", id)
+                    .SetFlag("presented", true)
+                    .SetFlag("selectable", true));
+            }
+            line.Set("decision_id", _decision)
+                .Set("decision_type", TreasureType)
+                .Set("source", "treasure")
+                .Set("n_presented", options.Count)
+                .Set("n_selectable", options.Count)
+                .SetFlag("decline_available", true)
+                .Set("options", options)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // OnPicked(player, int? index) prefix, for the local vote and a co-op partner's alike. A null
+    // index is the skip (the proceed button, opened chest or not). In co-op the relic that lands
+    // can differ from the vote, which is why the relic row still joins on its own.
+    private static void TreasurePicked(object __instance, object __0, int? __1)
+    {
+        try
+        {
+            if (_decisionType != TreasureType) return;
+            var relics = Enumerate(Reflect.GetMember(__instance, "CurrentRelics")).ToList();
+            // The game warns and returns on no active picking, and throws past the end.
+            if (relics.Count == 0 || __1 >= relics.Count || __1 < 0) return;
+            ReplayRecorder.Line("outcome")
+                ?.Set("decision_id", _decision)
+                .Set("decision_type", TreasureType)
+                .Set("outcome", __1 == null ? "skip" : "select")
+                .Set("option_id", __1 is int i ? Ids.Bare(Reflect.GetString(relics[i], "Id")) : null)
+                .Set("selected_option_indices", __1 is int j ? new List<int> { j } : new List<int>())
+                .Set("mine", Mine(__0))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CompleteWithNoRelics prefix: the chest opened empty (Silver Crucible). Not a choice, so it
+    // mints an id for the row but does not open a decision nothing will resolve.
+    private static void TreasureEmpty()
+    {
+        try
+        {
+            if (ReplayRecorder.Line("decision") is not { } line) return;
+            line.Set("decision_id", ReplayRecorder.NextDecisionId())
+                .Set("decision_type", TreasureType)
+                .Set("source", "treasure")
+                .Set("n_presented", 0)
+                .Set("n_selectable", 0)
+                .SetFlag("decline_available", false)
+                .Set("options", new List<ReplayLine>())
+                .Emit();
+        }
+        catch { }
+    }
+
+    // A relic reward's own decision, minted when it resolves rather than when it is populated:
+    // Hook.ModifyRewards runs after Populate and can drop a reward, which would leave an offer
+    // with no answer. Kept off _decision on purpose. The card reward on the same screen is the
+    // open decision and its acquire join depends on staying so.
+    private static readonly ConditionalWeakTable<object, StrongBox<int>> _relicRewardDecisions = new();
+
+    private static int? RelicRewardDecision(object reward, bool mint)
+    {
+        if (_relicRewardDecisions.TryGetValue(reward, out var box)) return box.Value;
+        if (!mint) return null;
+        var id = Ids.Bare(Reflect.GetString(Reflect.GetMember(reward, "Relic"), "Id"));
+        if (id == null) return null;
+        if (ReplayRecorder.Line("decision") is not { } line) return null;
+        var decision = ReplayRecorder.NextDecisionId();
+        _relicRewardDecisions.AddOrUpdate(reward, new StrongBox<int>(decision));
+        line.Set("decision_id", decision)
+            .Set("decision_type", "relic_reward")
+            .Set("source", "reward")
+            .Set("n_presented", 1)
+            .Set("n_selectable", 1)
+            .SetFlag("decline_available", true)
+            .Set("options", new List<ReplayLine>
+            {
+                new ReplayLine("o")
+                    .Set("option_index", 0)
+                    .Set("option_kind", "relic")
+                    .Set("option_id", id)
+                    .SetFlag("presented", true)
+                    .SetFlag("selectable", true),
+            })
+            .Emit();
+        return decision;
+    }
+
+    private static void RelicRewardSelecting(object __instance)
+    {
+        try { RelicRewardDecision(__instance, mint: true); }
+        catch { }
+    }
+
+    // The override guards on _wasTaken itself because LinkedRewardSet skips every member of a
+    // set, taken or not. Read strictly: an unreadable flag writes nothing rather than a skip.
+    private static void RelicRewardSkipped(object __instance)
+    {
+        try
+        {
+            if (Reflect.GetMember(__instance, "_wasTaken") is not false) return;
+            if (RelicRewardDecision(__instance, mint: true) is not { } decision) return;
+            ReplayRecorder.Line("outcome")
+                ?.Set("decision_id", decision)
+                .Set("decision_type", "relic_reward")
+                .Set("outcome", "skip")
                 .Emit();
         }
         catch { }
