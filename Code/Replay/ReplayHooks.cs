@@ -2898,7 +2898,7 @@ internal static class ReplayHooks
         catch { }
     }
 
-    // AfterBlockBroken(combatState, creature). Fired from CreatureCmd.LoseBlock when a strip takes
+    // AfterBlockBroken(combatState, choiceContext, creature, breaker). Fired from CreatureCmd.LoseBlock when a strip takes
     // the last of it, and from the WasBlockBroken sweep in CreatureCmd.Damage immediately before
     // the AfterDamageGiven that produces the hit row for the same blow.
     //
@@ -2906,12 +2906,15 @@ internal static class ReplayHooks
     // its own `lost` row a moment earlier, and block eaten by damage is on the hit row as
     // `blocked`. A delta here would double count either one. What the row adds is the zero
     // assertion described above, which is the only checkpoint a consumer gets for the damage path.
-    private static void BlockBroken(object __1)
+    //
+    // The creature is __2. __1 is the PlayerChoiceContext, which read as src "unknown" and was
+    // handed to CreatureSlots, minting a creature slot for an object that is not a creature.
+    private static void BlockBroken(object __2)
     {
         try
         {
-            if (__1 == null) return;
-            BlockRow(__1, null, "broken").Emit();
+            if (__2 == null) return;
+            BlockRow(__2, null, "broken").Emit();
         }
         catch { }
     }
