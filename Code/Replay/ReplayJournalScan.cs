@@ -5,17 +5,8 @@ using System.Text.Json;
 
 namespace SpireCodex.Replay;
 
-// Reading a journal back far enough to append to it safely.
-//
-// Separated from ReplayJournal purely so it is testable: everything here is file and string
-// handling with no Godot or game dependency, which lets SpireCodex.Tests compile this one
-// file instead of an assembly that cannot load outside the game.
 public static class ReplayJournalScan
 {
-    // Highest `s` already in the file, or -1 when it is new or unreadable. Reads the tail only;
-    // journals reach hundreds of KB and this runs on the run-start path.
-    // Also used by the crash-recovery scan, which appends its marker from outside the writer
-    // and so has no sequence state of its own.
     public static long LastSequence(string path)
     {
         try
@@ -37,27 +28,6 @@ public static class ReplayJournalScan
         catch { return -1; }
     }
 
-    // The counters a resumed session has to pick up from, recovered from the file it is about
-    // to append to.
-    //
-    // `s` has been resumed since the crash-recovery work, because the exploder keys events on
-    // (run_hash, s) and a second s=0,1,2... silently produced duplicate keys on exactly the
-    // save-scum runs that work existed to study. The card-instance id and the decision id have
-    // the same property and never got the same treatment: ReplayRecorder restarts both at 0 on
-    // every session, so after a reload `c: 7` and `decision_id: 3` name one thing in the first
-    // session and a DIFFERENT thing in the second, inside a single file, with nothing in the
-    // stream marking the change.
-    //
-    // Measured over 313 journals: 36% carry more than one session, and of those 96% re-mint a
-    // card id and 82% re-mint a decision id (worst case, 548 collided card ids in one run). A
-    // wrong instance id is worse than a missing one -- it silently fuses two physical cards
-    // into one lineage -- so the counters continue rather than restart.
-    //
-    // Unlike LastSequence this reads the WHOLE file, because these maxima are not near the
-    // tail. Ids are minted in ascending order, but the last lines of a run reference whichever
-    // cards happen to be in play, which are typically low-numbered starters; a tail read would
-    // report a high-water mark far below the true one and reissue ids anyway. It runs once per
-    // journal open, on the run-start path, against a file that reaches ~1.5 MB at the extreme.
     public readonly struct HighWater
     {
         public HighWater(long seq, int card, int decision, int creature, string? deckLine)
@@ -69,19 +39,12 @@ public static class ReplayJournalScan
             DeckLine = deckLine;
         }
 
-        // -1 when the file is new or unreadable, matching LastSequence.
         public long Seq { get; }
         public int Card { get; }
         public int Decision { get; }
 
-        // Creature ids have the same property as the two above and needed the same treatment:
-        // a body's id must name one body for the whole journal, and a second session that
-        // restarts at 1 makes the first fight's enemy and the eighth fight's enemy share it.
         public int Creature { get; }
 
-        // The raw text of the last line in the file that listed the whole deck, or null when
-        // there is none. Kept as text and parsed only if it is needed, so the common case (a
-        // new run) parses nothing at all.
         public string? DeckLine { get; }
     }
 
@@ -102,30 +65,21 @@ public static class ReplayJournalScan
             while ((line = reader.ReadLine()) != null)
             {
                 seq = MaxField(line, "s", seq);
-                // Every key that carries a minted card-instance id. `c` also appears inside the
-                // header's starting_deck rows, which scanning the raw line catches for free.
                 card = MaxField(line, "c", card);
                 card = MaxField(line, "deck_c", card);
                 card = MaxField(line, "from_c", card);
                 card = MaxField(line, "to_c", card);
                 card = MaxField(line, "instance_id", card);
-                // Card flow rows carry ids only inside arrays. A draw_order can mint ids for
-                // cards no later row names, so skipping these would reissue them.
                 card = MaxArray(line, "order_c", card);
                 card = MaxArray(line, "order_deck_c", card);
                 card = MaxArray(line, "flushed_c", card);
                 card = MaxArray(line, "retained_c", card);
                 decision = MaxField(line, "decision_id", decision);
-                // Every key that carries a creature id. The needle includes the leading quote,
-                // so "cid" cannot also match "target_cid" and each has to be named.
                 creature = MaxField(line, "cid", creature);
                 creature = MaxField(line, "target_cid", creature);
                 creature = MaxField(line, "src_cid", creature);
                 creature = MaxField(line, "dst_cid", creature);
                 creature = MaxField(line, "tgt_cid", creature);
-                // The newest full deck listing wins, whichever kind wrote it: a `deck` row from
-                // mid-session, or the `starting_deck` on a header. Cheap substring tests, so the
-                // scan stays one pass and allocates nothing per line.
                 if (line.Contains("\"t\":\"deck\"", StringComparison.Ordinal)
                     || line.Contains("\"starting_deck\":", StringComparison.Ordinal))
                     deckLine = line;
@@ -133,15 +87,10 @@ public static class ReplayJournalScan
         }
         catch
         {
-            // A truncated or unreadable tail still leaves everything read so far usable, and a
-            // high-water mark that is too LOW is the pre-existing behaviour, not a regression.
         }
         return new HighWater(seq, (int)card, (int)decision, (int)creature, deckLine);
     }
 
-    // Highest value of "<key>":<integer> anywhere in the line, or `best` when the key is absent.
-    // The leading quote is part of the needle, so "c" does not also match "deck_c" and "s" does
-    // not match "ms" or "stars_paid".
     private static long MaxField(string line, string key, long best)
     {
         var needle = "\"" + key + "\":";
@@ -149,10 +98,6 @@ public static class ReplayJournalScan
         while (at >= 0)
         {
             var start = at + needle.Length;
-            // Tolerate whitespace after the colon. The writer never emits it, so this costs
-            // nothing in practice, but without it any journal not produced by this writer
-            // silently reads as "no sequence" and the caller restarts from 0. That is how a
-            // hand-written test fixture fooled me into thinking the recovery fix had failed.
             while (start < line.Length && char.IsWhiteSpace(line[start])) start++;
             var end = start;
             while (end < line.Length && char.IsDigit(line[end])) end++;
@@ -163,7 +108,6 @@ public static class ReplayJournalScan
         return best;
     }
 
-    // Highest integer inside "<key>":[...] anywhere in the line, or `best` when absent.
     private static long MaxArray(string line, string key, long best)
     {
         var needle = "\"" + key + "\":[";
@@ -184,10 +128,6 @@ public static class ReplayJournalScan
         return best;
     }
 
-    // The deck a stored listing describes, as remap entries. Returns an empty list for
-    // anything it cannot read: a malformed line, or a listing written before deck rows carried
-    // `up`, in which case the key would be built from different fields on the two sides and
-    // would mis-align rather than fail. A listing we cannot key is not a listing we can trust.
     public static List<DeckRemap.Entry> DeckEntries(string? line)
     {
         var rows = new List<DeckRemap.Entry>();
@@ -195,9 +135,6 @@ public static class ReplayJournalScan
         try
         {
             using var doc = JsonDocument.Parse(line);
-            // `cards` is NOT unique to a deck listing -- the `shop` row carries the shelf under
-            // the same key. Gate on the row type so a shop's stock can never be read as a deck;
-            // the missing-`up` refusal below would catch it today, but only by luck.
             var kind = Text(doc.RootElement, "t");
             if (kind != "deck" && kind != "header") return rows;
             if (!doc.RootElement.TryGetProperty("cards", out var cards)
@@ -209,13 +146,8 @@ public static class ReplayJournalScan
                 if (card.ValueKind != JsonValueKind.Object) return Empty(rows);
                 if (!card.TryGetProperty("c", out var c) || c.ValueKind != JsonValueKind.Number)
                     return Empty(rows);
-                // `up` absent means the capture predates it. Without it the key is not
-                // comparable against a live deck that has it, so refuse the whole listing.
                 if (!card.TryGetProperty("up", out var up) || up.ValueKind != JsonValueKind.Number)
                     return Empty(rows);
-                // `added_floor` is optional, unlike `up`. It is not part of the key, so a listing
-                // without it still aligns exactly as it did before; its absence just leaves the
-                // entry untagged, which DeckRemap reads as "unknown" rather than "different".
                 rows.Add(new DeckRemap.Entry(c.GetInt32(), Key(
                     Text(card, "id"), up.GetInt32(), Text(card, "enchantment"),
                     card.TryGetProperty("amount", out var amt)
@@ -228,14 +160,9 @@ public static class ReplayJournalScan
         return rows;
     }
 
-    // One place that builds the key, called for the stored side here and for the live side by
-    // the recorder, because two spellings of the same key align nothing.
     public static string Key(string? id, int up, string? enchantment, int amount)
         => $"{id}|{up}|{enchantment}|{amount}";
 
-    // The tag half of a deck entry, spelled here for the same reason Key is: the stored side and
-    // the live side have to agree character for character or they align nothing. Prefixed so a
-    // second component can be added later without a bare number silently colliding with it.
     public static string? Tag(int? addedFloor)
         => addedFloor == null
             ? null

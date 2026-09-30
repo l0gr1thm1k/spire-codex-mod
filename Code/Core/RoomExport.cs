@@ -4,21 +4,6 @@ using SpireCodex.Producer;
 
 namespace SpireCodex.Core;
 
-// Reads the current room's spectator detail off RunState.CurrentRoom: the live event
-// (name, prompt, the options on offer) when it's an event room, and the merchant
-// inventory (items + costs) when it's a shop. Both are small and change rarely, so they
-// are computed per snapshot (no separate throttle) and returned as plain DTOs; all game
-// reflection stays here in Core.
-//
-// Reachability confirmed against the decompiled sts2.dll:
-//  - RunState.CurrentRoom -> AbstractRoom? (the room stack's last entry).
-//  - EventRoom.LocalMutableEvent -> the live EventModel clone that actually holds state
-//    (BeginEvent runs on CanonicalEvent.ToMutable(), so CanonicalEvent itself stays bare).
-//    Reading it is side-effect-free: GetLocalEvent() is a verified pure _events[slot] list
-//    lookup. EventModel.Title/Description are LocStrings (resolve via GetFormattedText()),
-//    and CurrentOptions is the live IReadOnlyList<EventOption>.
-//  - MerchantRoom.Inventory.{CardEntries,RelicEntries,PotionEntries,CardRemovalEntry};
-//    each entry exposes Id (via Model/CreationResult.Card), Cost, IsStocked, IsOnSale.
 internal static class RoomExport
 {
     public static (EventInfo? Event, ShopInfo? Shop, RestInfo? RestSite) Read(object? state)
@@ -35,10 +20,6 @@ internal static class RoomExport
         };
     }
 
-    // RestSiteRoom.Options (the local player's campfire choices). Each RestSiteOption has a
-    // stable OptionId (HEAL/SMITH/DIG/...), a localized Title, and IsEnabled. The button state
-    // for the spectator's rest panel; the actual rest/smith action rides the "rest"/"upgrade"
-    // ticker kinds.
     private static RestInfo? ReadRest(object room)
     {
         if (Reflect.GetMember(room, "Options") is not IEnumerable opts) return null;
@@ -57,8 +38,6 @@ internal static class RoomExport
 
     private static EventInfo? ReadEvent(object room)
     {
-        // The live mutable event holds the current page + options; fall back to the
-        // canonical instance for the id if the synchronizer isn't ready yet.
         var live = Reflect.GetMember(room, "LocalMutableEvent");
         var idSource = live ?? Reflect.GetMember(room, "CanonicalEvent");
         var id = Ids.Bare(Reflect.GetString(room, "ModelId"))
@@ -91,9 +70,6 @@ internal static class RoomExport
             options);
     }
 
-    // The card an event option references, pulled from its CardHoverTip (the same preview the game
-    // shows on hover, e.g. the card Slippery Bridge's "Overcome" option will make you lose). The
-    // game pre-picks and displays it, so it's knowable before the choice. Null when no card is hovered.
     internal static string? OptionCard(object opt)
     {
         if (Reflect.GetMember(opt, "HoverTips") is not IEnumerable tips) return null;
@@ -108,9 +84,6 @@ internal static class RoomExport
 
     private static ShopInfo? ReadShop(object room)
     {
-        // MerchantRoom holds per-player Inventories (plural); read the local player's.
-        // GetLocalInventory() is co-op-correct; fall back to the first inventory (single
-        // player, or if the local lookup can't resolve yet).
         var inv = Reflect.Call(room, "GetLocalInventory") ?? FirstInventory(room);
         if (inv == null) return null;
 
@@ -130,7 +103,6 @@ internal static class RoomExport
         return new ShopInfo(cards, relics, potions, removal);
     }
 
-    // First merchant inventory (single-player fallback when GetLocalInventory can't resolve).
     private static object? FirstInventory(object room)
     {
         if (Reflect.GetMember(room, "Inventories") is IEnumerable list)
@@ -139,7 +111,6 @@ internal static class RoomExport
         return null;
     }
 
-    // Card entries: id lives under CreationResult.Card; IsOnSale flags the discounted one.
     private static void AddCards(object? entries, List<ShopItemInfo> into, string slot)
     {
         if (entries is not IEnumerable list) return;
@@ -154,7 +125,6 @@ internal static class RoomExport
         }
     }
 
-    // Relic/potion entries: id lives under Model; no on-sale flag.
     private static void AddModelItems(object? entries, List<ShopItemInfo> into)
     {
         if (entries is not IEnumerable list) return;
@@ -167,26 +137,12 @@ internal static class RoomExport
         }
     }
 
-    // Loc entries whose GetFormattedText() does not resolve, so we stop calling them.
-    //
-    // Some event descriptions interpolate variables the LocString has not been given
-    // ("Gain {SoloGold} Gold", "{Enchantment1}"). Formatting those THROWS, and the game's own
-    // LocManager logs a multi-line ERROR with a stack trace before the exception reaches us.
-    // This runs from the 10 Hz producer tick, so a single event screen was emitting the same
-    // engine error several times a second for as long as the player stood on it.
-    //
-    // Only failures are remembered, never successes: descriptions carry run-specific rolled
-    // values, so caching a resolved string could serve a stale number. A key that failed once
-    // in this session fails identically every time, and skipping it costs nothing.
     private static readonly HashSet<string> _unresolvable = new();
 
-    // A LocString resolves its localized text only through GetFormattedText(); its
-    // ToString() is unhelpful. Null/empty -> null so the payload omits it.
     private static string? LocText(object? locString)
     {
         if (locString == null) return null;
 
-        // Identity is (table, entry key); reading those does no formatting and cannot throw.
         var table = Reflect.GetString(locString, "LocTable");
         var key = Reflect.GetString(locString, "LocEntryKey");
         var id = table != null && key != null ? table + "|" + key : null;
