@@ -327,10 +327,35 @@ public static class ReplayRecorder
             //    is omitted and a cid that cannot be resolved is absent. Without a version to
             //    branch on, "this mod version did not record it" and "this run could not read
             //    it" are the same missing field.
+            // 7  adds, among others: act/map rows and map decisions, room_exit, intent and
+            //    attack, spawn and death (cause "doom" for a Doom kill), power_lost and
+            //    power_negated, afflict/unafflict, flush, draw_order, energy and stars (every
+            //    level change, with the balance after), forge, relic_counter, max_hp,
+            //    play_blocked (every refused autoplay, with a reason), downgrade,
+            //    potion_start, console, and rest/treasure/relic_reward decisions; header
+            //    `mods`, `harmony_owners` and `full_console`; deck rows `added_floor` and
+            //    `state`. It CHANGES rows a 6 reader relies on:
+            //      hp      every creature, named by dst/dst_cid, not only the player; no row
+            //              for in-combat damage (the hit row has it); heals clamped to max
+            //              with `overheal`; out-of-combat losses carry src "loss".
+            //      turn    `n` (and end_turn.n, combat_end.turns) is the turn number, not the
+            //              round, which moves to `round`/`rounds`; play.turn is still the round.
+            //      combat_end  also written on a loss, with `result`.
+            //      block   `n` signed or absent, with `reason` and `left`; gold rows include
+            //              losses.
+            //      act     written before the act's map, not after its first room.
+            //      event   decisions come one per page, from the page funnel; Proceed is an
+            //              event_proceed row rather than an outcome.
+            //      c       draw_order mints a handle for every draw-pile card at combat start,
+            //              so instance numbering differs from a 6 journal of the same run.
+            //      rest, transform, upgrade  rest covers every option; transform covers every
+            //              call site; neither transform nor upgrade claims a select that is
+            //              not its own.
             //
             // The backend rejects a replay_version it has not shipped (400 bad_header against
-            // KNOWN_REPLAY_VERSIONS), and on that path the mod marks the journal sent, so the
-            // allowlist has to accept 6 before this ships.
+            // KNOWN_REPLAY_VERSIONS). ReplayUploader keeps a 400'd journal and offers it again on
+            // a later launch, so nothing is lost, but nothing lands either until the allowlist
+            // accepts 7.
             ?.Set("replay_version", 7)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
