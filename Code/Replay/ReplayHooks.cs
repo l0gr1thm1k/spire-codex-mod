@@ -597,6 +597,26 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRestSiteHeal", me, nameof(RestHeal));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRestSiteSmith", me, nameof(RestSmith));
 
+        // --- rest sites ---
+        // Two prefixes on AfterRoomEntered: Harmony orders equal priorities by registration, so
+        // this one runs after RoomEntered and the offer follows its room row.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRoomEntered", me, nameof(RestSiteEntered));
+        var restSync = HookPatcher.FindType("MegaCrit.Sts2.Core.Multiplayer.Game.RestSiteSynchronizer");
+        var restPatched = 0;
+        attempted++; restPatched += HookPatcher.PatchOn(harmony, restSync, "ChooseOption", me,
+                                        nameof(RestChoosing), 2, firstParamType: "Player");
+        attempted++; restPatched += HookPatcher.PatchOn(harmony, restSync, "ChooseOption", me,
+                                        nameof(RestChosen), 2, firstParamType: "Player", postfix: true);
+        n += restPatched;
+        _restFunnel = restPatched == 2;
+        var playerType = HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Players.Player");
+        _restOptionsFor = playerType == null ? null
+            : restSync?.GetMethod("GetOptionsForPlayer", new[] { playerType });
+        if (_restOptionsFor == null)
+            MainFile.Logger.Info("replay-hooks: GetOptionsForPlayer(Player) not found; rest rows omit option");
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Models.RelicModel"),
+                                 "InvokeDisplayAmountChanged", me, nameof(RelicCounterChanged), 0, postfix: true);
+
         // --- events ------------------------------------------------------------------
         //
         // Event pages come from the game's own funnels, not from the live snapshot. The snapshot
@@ -3716,7 +3736,7 @@ internal static class ReplayHooks
             // there is no decision for such a relic to belong to and omitting is correct.
             // Deciding on the open decision's TYPE asks the right question: not how the relic
             // arrived, but whether the thing waiting for an answer could produce one at all.
-            var grantable = _decisionType == "event";
+            var grantable = _decisionType is "event" or "rest";
             ReplayRecorder.Line("relic")
                 ?.Set("decision_id",
                       !fromShelf && grantable && _decision > 0 ? _decision : (int?)null)
@@ -3820,10 +3840,16 @@ internal static class ReplayHooks
     // and destroy the only witness that the option was taken -- the `hp` row the heal produces says
     // a heal happened, not that an event offered a rest -- and silence is the failure this record
     // exists to avoid. A consumer counting campfires filters on the flag instead.
+    //
+    // With the choice funnel patched, this only still owns the mimicked heal, which never goes
+    // through a campfire. A campfire heal is written by RestChoiceSettled, and Mend also fires
+    // this hook (for its target), so letting both write would double every heal and file each
+    // Mend as a heal.
     private static void RestHeal(bool __2)
     {
         try
         {
+            if (_restFunnel && !__2) return;
             ReplayRecorder.Line("rest")
                 ?.Set("option", "heal")
                 // SetFlag, so the false case is written too: a heal with no flag at all would be a
@@ -3834,9 +3860,199 @@ internal static class ReplayHooks
         catch { }
     }
 
+    // Fallback only: the funnel writes smith itself, and this is its sole caller.
     private static void RestSmith()
     {
+        if (_restFunnel) return;
         try { ReplayRecorder.Line("rest")?.Set("option", "smith").Emit(); } catch { }
+    }
+
+    // --- rest sites ------------------------------------------------------------------
+    //
+    // Only heal and smith have hooks; the other seven campfire options (cook, clone, dig, hatch,
+    // kindle, lift, mend) left nothing. RestSiteSynchronizer.ChooseOption is the one path for
+    // the local click and a peer's message, so every option of every player is seen there.
+
+    // True once both halves of the ChooseOption patch are in. RestHeal/RestSmith defer to it.
+    private static bool _restFunnel;
+
+    // The open rest offer's decision id (0 = none) and how many choices this visit already made.
+    // Miniature Tent allows several choices and removes each taken option, so every choice gets
+    // its own offer and option_index is relative to that offer.
+    private static int _restDecision;
+    private static int _restChoiceIndex;
+
+    // RestSiteSynchronizer.GetOptionsForPlayer(Player). Resolved by parameter type because the
+    // name is overloaded with a ulong version.
+    private static MethodInfo? _restOptionsFor;
+
+    // Handed from the ChooseOption prefix to its postfix. Both run synchronously inside one call,
+    // so a single slot cannot interleave with another choice.
+    private sealed record RestChoice(object Player, string? Id, int Index, bool Mine, int Decision);
+    private static RestChoice? _restPending;
+
+    // Hook.AfterRoomEntered(IRunState, AbstractRoom) prefix, registered after RoomEntered so the
+    // offer lands after its room row. RestSiteRoom.EnterInternal has already run BeginRestSite,
+    // so Options holds the local player's generated list.
+    private static void RestSiteEntered(object __1)
+    {
+        try
+        {
+            if (__1?.GetType().Name != "RestSiteRoom") return;
+            _restChoiceIndex = 0;
+            OfferRest(Reflect.GetMember(__1, "Options"));
+        }
+        catch { }
+    }
+
+    // One decision row per rest offer, shaped like the event and card_reward decisions.
+    private static void OfferRest(object? list)
+    {
+        _restDecision = 0;
+        var options = new List<ReplayLine>();
+        var selectable = 0;
+        var enabledKnown = true;
+        foreach (var opt in Enumerate(list))
+        {
+            var row = new ReplayLine("o")
+                .Set("option_index", options.Count)
+                .Set("option_kind", "rest_option")
+                .Set("option_id", Reflect.GetString(opt, "OptionId")?.ToLowerInvariant())
+                .SetFlag("presented", true);
+            // IsEnabled is Smith with nothing upgradable or Cook with under two removable cards.
+            if (Reflect.GetMember(opt, "IsEnabled") is bool enabled)
+            {
+                row.SetFlag("selectable", enabled);
+                if (enabled) selectable++;
+                else row.Set("selectable_reason", "disabled");
+            }
+            else enabledKnown = false;
+            options.Add(row);
+        }
+        if (options.Count == 0) return;
+        if (ReplayRecorder.Line("decision") is not { } line) return;
+        _restDecision = ReplayRecorder.NextDecisionId();
+        line.Set("decision_id", _restDecision)
+            .Set("decision_type", "rest")
+            .Set("source", "rest_site")
+            .Set("choice_index", _restChoiceIndex)
+            // NRestSiteRoom keeps Proceed disabled until a choice succeeds, so only a Tent's
+            // follow-up offers can be walked away from.
+            .SetFlag("decline_available", _restChoiceIndex > 0)
+            .Set("n_presented", options.Count)
+            .Set("n_selectable", enabledKnown ? selectable : (int?)null)
+            .Set("options", options)
+            .Emit();
+    }
+
+    // RestSiteSynchronizer.ChooseOption(Player player, int optionIndex) prefix. Reads the option
+    // before OnSelect can run and before a success removes it from the list. Makes the rest
+    // offer the open decision so a Dig or Hatch relic row joins to it.
+    private static void RestChoosing(object __instance, object __0, int __1)
+    {
+        _restPending = null;
+        try
+        {
+            object? opt = null;
+            try { opt = ElementAt(_restOptionsFor?.Invoke(__instance, new[] { __0 }), __1); }
+            catch { }
+            var mine = !LocalPlayer.IsCoop || LocalPlayer.IsLocalPlayer(__0);
+            var decision = mine ? _restDecision : 0;
+            if (decision > 0)
+            {
+                DemoteDecision();
+                _decision = decision;
+                _decisionType = "rest";
+            }
+            _restPending = new RestChoice(__0, Reflect.GetString(opt, "OptionId")?.ToLowerInvariant(),
+                                          __1, mine, decision);
+        }
+        catch { }
+    }
+
+    // Same method, postfix. ChooseOption is async and this runs at its first await (inside
+    // OnSelect, possibly a card selector that stays open for minutes), so the row is written
+    // from a continuation on the returned Task instead: that is the only point that knows
+    // whether the choice succeeded. ExecuteSynchronously keeps it on the game thread that
+    // completed the task, ahead of the UI awaiting the same task.
+    private static void RestChosen(object? __result)
+    {
+        var choice = _restPending;
+        _restPending = null;
+        try
+        {
+            if (choice == null || __result is not System.Threading.Tasks.Task<bool> task) return;
+            task.ContinueWith(t => RestChoiceSettled(choice, t),
+                System.Threading.CancellationToken.None,
+                System.Threading.Tasks.TaskContinuationOptions.ExecuteSynchronously,
+                System.Threading.Tasks.TaskScheduler.Default);
+        }
+        catch { }
+    }
+
+    private static void RestChoiceSettled(RestChoice choice, System.Threading.Tasks.Task<bool> t)
+    {
+        try
+        {
+            if (choice.Decision > 0 && _decisionType == "rest" && _decision == choice.Decision)
+                DemoteDecision();
+            // False is a cancelled Smith/Cook selector or a Mend with no target. The option stays
+            // on offer and the player picks again, so nothing happened yet. A cancelled selector
+            // already has its own decline outcome.
+            if (t.Status != System.Threading.Tasks.TaskStatus.RanToCompletion || !t.Result) return;
+
+            var line = ReplayRecorder.Line("rest");
+            line?.Set("option", choice.Id)
+                .Set("decision_id", choice.Decision > 0 ? choice.Decision : (int?)null)
+                .Set("option_index", choice.Decision > 0 ? choice.Index : (int?)null)
+                .Set("mine", Mine(choice.Player));
+            // Same shape the heal row has always had; a mimicked heal comes from RestHeal.
+            if (choice.Id == "heal") line?.SetFlag("mimicked", false);
+            line?.Emit();
+
+            if (!choice.Mine) return;
+            _restChoiceIndex++;
+            // Empty unless something (Miniature Tent) kept the remaining options open.
+            OfferRest(Reflect.Call(Reflect.GetStatic(
+                HookPatcher.FindType("MegaCrit.Sts2.Core.Runs.RunManager"), "Instance") is { } rm
+                    ? Reflect.GetMember(rm, "RestSiteSynchronizer") : null, "GetLocalOptions"));
+        }
+        catch { }
+    }
+
+    // Relic counters. RelicModel.InvokeDisplayAmountChanged postfix: every counter setter
+    // (Girya.TimesLifted, PumpkinCandle.KindleCount, Winged Boots, Pendulum...) calls it.
+    //
+    // Only changes OUTSIDE combat, deduped per relic. In-combat counters (Pen Nib, Nunchaku,
+    // Kunai...) tick per card or turn and follow from play rows, so recording them would add
+    // rows per play. Outside combat is where the run-long state moves: a Kindle or Lift, the
+    // candle burning down at each combat end, a boot used on the map. A few rows per run.
+    // Hook.AfterCombatEnd runs with IsInProgress already false, so combat-end ticks are seen.
+    private static readonly ConditionalWeakTable<object, StrongBox<int>> _relicCounters = new();
+
+    private static void RelicCounterChanged(object __instance)
+    {
+        try
+        {
+            // Unreadable combat state writes nothing rather than guessing "not in combat".
+            if (Reflect.GetMember(Reflect.GetStatic(_combatManagerType, "Instance"),
+                                  "IsInProgress") is not false) return;
+            if (Reflect.GetMember(__instance, "DisplayAmount") is not int n) return;
+            // No owner means a relic being deserialized or previewed, not a run event.
+            var owner = Reflect.GetMember(__instance, "Owner");
+            if (owner == null) return;
+            if (_relicCounters.TryGetValue(__instance, out var last) && last.Value == n) return;
+            if (ReplayRecorder.Line("relic_counter") is not { } line) return;
+            _relicCounters.AddOrUpdate(__instance, new StrongBox<int>(n));
+            line.Set("id", Ids.Bare(Reflect.GetString(__instance, "Id")))
+                .Set("n", n)
+                // Same allow-list RelicObtained uses: only a decision that can cause this.
+                .Set("decision_id", _decisionType is "event" or "rest" && _decision > 0
+                                        ? _decision : (int?)null)
+                .Set("mine", Mine(owner))
+                .Emit();
+        }
+        catch { }
     }
 
     // --- events ----------------------------------------------------------------------
