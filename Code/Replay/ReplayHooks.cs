@@ -428,6 +428,9 @@ internal static class ReplayHooks
         // marker, so the pair it produces is readable as one swap rather than two coincidences.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
                                  "Replace", me, nameof(RelicReplacing), 2);
+        // A potion's effects land between these two. potion_used alone comes AFTER them, so
+        // a row it caused could not be told from a row nothing caused.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforePotionUsed", me, nameof(PotionStarting));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionUsed", me, nameof(PotionUsed));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionProcured", me, nameof(PotionProcured));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionDiscarded", me, nameof(PotionDiscarded));
@@ -2005,6 +2008,30 @@ internal static class ReplayHooks
                 // ever a guess about ordering.
                 .Set("reason", replacing ? "replaced" : "removed")
                 .Set("mine", Mine(Reflect.GetMember(__0, "Owner")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Hook.BeforePotionUsed(runState, combatState, potion, target). PotionModel.OnUseWrapper
+    // calls it before OnUse, so this row opens the potion's effects and potion_used closes them.
+    //
+    // Without it a potion was recorded only by its consequences: its block, power and hit rows
+    // came first and the potion_used marker after, so a cardless block row read the same
+    // whether a potion had caused it or nothing in the journal had. On T3L8L1NTV2LW f15 that
+    // was a 15 block with no play, no relic that grants block, and no potion_used after it,
+    // and the only way to rule a potion out was to check every potion's numbers by hand.
+    //
+    // The target is here too. potion_used never carried one, so a targeted potion's aim had
+    // to be read back from the rows its effect wrote.
+    private static void PotionStarting(object __2, object? __3)
+    {
+        try
+        {
+            ReplayRecorder.Line("potion_start")
+                ?.Set("id", Ids.Bare(Reflect.GetString(__2, "Id")))
+                .Set("target", __3 == null ? null : CreatureRef(__3))
+                .Set("target_cid", CreatureSlots.Maybe(__3))
                 .Emit();
         }
         catch { }
