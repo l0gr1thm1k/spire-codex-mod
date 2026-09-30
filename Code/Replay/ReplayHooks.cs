@@ -322,6 +322,7 @@ internal static class ReplayHooks
                                  "Remove", me, nameof(RelicRemoved), 1, postfix: true);
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.RelicCmd"),
                                  "Replace", me, nameof(RelicReplacing), 2);
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforePotionUsed", me, nameof(PotionStarting));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionUsed", me, nameof(PotionUsed));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionProcured", me, nameof(PotionProcured));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionDiscarded", me, nameof(PotionDiscarded));
@@ -2553,6 +2554,7 @@ internal static class ReplayHooks
     }
 
     private static void PotionUsed(object __2, object __3) => Potion("potion_used", __2, __3);
+    private static void PotionStarting(object __2, object __3) => Potion("potion_start", __2, __3);
     private static void PotionProcured(object __2) => Potion("potion_got", __2);
     private static void PotionDiscarded(object __2) => Potion("potion_dropped", __2);
 
