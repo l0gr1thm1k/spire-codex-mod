@@ -152,6 +152,7 @@ internal static class ReplayHooks
         _eventDecision = 0;
         _eventPageIndex = -1;
         _eventId = null;
+        ResetAttacks(); // attacks
     }
 
     // MerchantEntry.OnTryPurchaseWrapper(inventory, ignoreCost) — fires on the ATTEMPT, so the
@@ -592,6 +593,20 @@ internal static class ReplayHooks
         if (_addVarsMethod == null)
             MainFile.Logger.Info("replay-hooks: DynamicVarSet.AddTo not found; "
                                  + "event option label/desc are omitted");
+
+        // --- attacks -----------------------------------------------------------------
+        // Groups the hits of one attack under a shared `atk` id, and puts the models that
+        // changed a number (Strength, Vulnerable, Frail...) on the hit or block row they
+        // explain. All prefixes: each state change has to land before the hook's listeners
+        // run, since a listener can start a nested attack or damage call of its own.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeAttack", me, nameof(AttackOpened));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "ModifyAttackHitCount", me, nameof(AttackHitCount), postfix: true);
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterAttack", me, nameof(AttackClosed));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterModifyingDamageAmount", me, nameof(DamageModified));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeDamageReceived", me, nameof(DamageLanding));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterModifyingHpLostBeforeOsty", me, nameof(HpLossModified));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterModifyingHpLostAfterOsty", me, nameof(HpLossModified));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterModifyingBlockAmount", me, nameof(BlockModified));
 
         // --- combat lifecycle --------------------------------------------------------
         // An extra turn shares its ROUND with the turn it extends: CombatManager.SwitchSides
@@ -1578,10 +1593,12 @@ internal static class ReplayHooks
     // damage dealt = dmg + (overkill ?? 0). DamageResult.TotalDamage is deliberately NOT
     // recorded; it is a derived property, BlockedDamage + UnblockedDamage, both of which are
     // already on this row, and it is truncated on a lethal hit for the same reason dmg is.
-    private static void DamageGiven(object __2, object __3, object __4, object __5, object __6)
+    private static void DamageGiven(object __1, object __2, object __3, object __4, object __5, object __6)
     {
         try
         {
+            // attacks: taken before anything else so the latch is released even when no row is written.
+            var why = TakeDamageFrame(__1, __5, __2, __6);
             var dealerIsPlayer = Reflect.GetMember(__2, "IsPlayer") is true;
             var targetIsPlayer = Reflect.GetMember(__5, "IsPlayer") is true;
             if (targetIsPlayer && Reflect.GetBool(__3, "WasTargetKilled")) PlayerDied = true;
@@ -1590,7 +1607,8 @@ internal static class ReplayHooks
             // so this is "HP lost in combat", not "net HP change".
             if (targetIsPlayer && _hpLostInCombat is { } lost)
                 _hpLostInCombat = lost + Reflect.GetInt(__3, "UnblockedDamage", 0);
-            ReplayRecorder.Line("hit")
+            var hit = ReplayRecorder.Line("hit");
+            hit
                 // A null dealer is an effect (poison, thorns, disintegration), not a missing
                 // read. Naming it keeps that distinguishable from a failed reflection.
                 ?.Set("src", dealerIsPlayer ? "player"
@@ -1618,6 +1636,10 @@ internal static class ReplayHooks
                 // as the player attacking the enemy in the middle of the enemy's turn.
                 .Set("dmg_type", DamageProps(__4))
                 .Set("card", __6 == null ? null : Ids.Bare(Reflect.GetString(__6, "Id")))
+                // attacks: see the attacks section.
+                .Set("atk", hit == null ? null : AttackIdFor(__1, __2, __6, __4))
+                .Set("mods", why?.Mods)
+                .Set("hp_mods", why?.HpMods)
                 .Emit();
         }
         catch { }
@@ -1987,6 +2009,261 @@ internal static class ReplayHooks
         catch { }
     }
 
+    // --- attacks ---------------------------------------------------------------------
+    //
+    // Two things the hit and block rows could not say on their own.
+    //
+    // `atk` on a hit: which attack it belonged to. A monster multi-attack has no card, so its
+    // hits were N unrelated rows and "how many times was I attacked" returned the hit count.
+    // Hits of one attack share an id; damage that is not an attack (poison, thorns, relic
+    // pings) carries none. An `attack` row is written at AfterAttack only when it says
+    // something the hits don't: more than one hit, a random target, or fewer hits than planned.
+    //
+    // `mods` / `hp_mods` on a hit, `mods` on a block gain: the models that changed the number
+    // (Strength, Vulnerable, Intangible, Frail, Tungsten Rod...). Card enchantments are applied
+    // in the same Modify calls but the game never adds them to the list, so they can't appear.
+    //
+    // The modifier hooks carry no creature, so they are paired with the row by call order in
+    // CreatureCmd.Damage / GainBlock. Every latch is checked against its combat state and
+    // dropped on a new fight or run, so a leak from a throw can't reach a later fight.
+
+    private sealed class AttackFrame
+    {
+        public object? Command, Attacker, Card, Combat;
+        public long? Id;
+        public int? Planned;
+    }
+
+    private sealed class DamageFrame
+    {
+        public object? Target, Dealer, Card, Combat;
+        public List<string>? Mods, HpMods;
+    }
+
+    private sealed class BlockFrame
+    {
+        public object? Combat, Card;
+        public decimal Amount;
+        public List<string>? Mods;
+    }
+
+    private static readonly List<AttackFrame> OpenAttacks = new();
+    private static readonly List<DamageFrame> OpenDamage = new();
+    private static readonly List<BlockFrame> OpenBlock = new();
+    // Damage modifiers between AfterModifyingDamageAmount and the BeforeDamageReceived that
+    // names their target. A stack, not a slot: a listener of the first can deal damage itself.
+    private static readonly Stack<List<string>?> PendingDamageMods = new();
+
+    // Next attack id, or 0 when this journal session has not minted one yet.
+    //
+    // Seeded from the journal's last `s` + 1 and minted only for a hit row being written, so a
+    // session never mints more ids than it writes lines. A reload resumes `s` above everything
+    // in the file, so seeding from it can't reissue an id the earlier session used, with no
+    // extra scan field. The ids are run-unique, not sequence numbers.
+    private static long _atkNext;
+    private static long _atkHigh;
+
+    private static void ResetAttacks()
+    {
+        OpenAttacks.Clear();
+        OpenDamage.Clear();
+        OpenBlock.Clear();
+        PendingDamageMods.Clear();
+        _atkNext = 0;
+    }
+
+    private static long? NextAttackId()
+    {
+        if (_atkNext <= 0)
+        {
+            var path = ReplayRecorder.CurrentPath;
+            if (path == null) return null;
+            _atkNext = Math.Max(Math.Max(ReplayJournal.LastSequence(path) + 1, _atkHigh + 1), 1);
+        }
+        var id = _atkNext++;
+        _atkHigh = Math.Max(_atkHigh, id);
+        return id;
+    }
+
+    // Model ids of a modifier list, null when it is empty. An unreadable id is written as
+    // "unknown" rather than dropped: dropping it could turn "one modifier" into "none".
+    private static List<string>? ModelIds(object? models)
+    {
+        var ids = Enumerate(models)
+            .Select(m => Ids.Bare(Reflect.GetString(m, "Id")) ?? "unknown")
+            .Distinct().ToList();
+        return ids.Count > 0 ? ids : null;
+    }
+
+    // BeforeAttack(combatState, command). Fires from AttackCommand.Execute and from
+    // AttackContext.CreateAsync (Echoing Slash, Omnislice), which both pair it with AfterAttack.
+    private static void AttackOpened(object __0, object __1)
+    {
+        try
+        {
+            if (__1 == null) return;
+            OpenAttacks.RemoveAll(f => !ReferenceEquals(f.Combat, __0));
+            if (OpenAttacks.Count > 16) OpenAttacks.Clear();
+            OpenAttacks.Add(new AttackFrame
+            {
+                Command = __1,
+                Attacker = Reflect.GetMember(__1, "Attacker"),
+                // Execute passes `ModelSource as CardModel` as the Damage cardSource, and only
+                // FromCard / FromOsty ever set ModelSource, so it is the card or null.
+                Card = Reflect.GetMember(__1, "ModelSource"),
+                Combat = __0,
+            });
+        }
+        catch { }
+    }
+
+    // ModifyAttackHitCount(combatState, command, originalHitCount), postfix for the result.
+    // Only AttackCommand.Execute calls it, right after BeforeAttack. The loop runs while
+    // i < count, so a fractional count rounds up.
+    private static void AttackHitCount(object __1, decimal __result)
+    {
+        try
+        {
+            var f = OpenAttacks.LastOrDefault(x => ReferenceEquals(x.Command, __1));
+            if (f != null) f.Planned = (int)Math.Ceiling(__result);
+        }
+        catch { }
+    }
+
+    // The attack a hit belongs to, or null. Only the innermost open attack is considered, and
+    // only when the dealer, the card and the combat are the attack's own and the damage is a
+    // Move: that keeps thorns, relic pings and power ticks that fire inside an attack from
+    // being stamped as part of it. A nested attack opens its own frame on top.
+    private static long? AttackIdFor(object combat, object? dealer, object? card, object? props)
+    {
+        if (OpenAttacks.Count == 0) return null;
+        var f = OpenAttacks[^1];
+        if (!ReferenceEquals(f.Combat, combat) || !ReferenceEquals(f.Attacker, dealer)
+            || !ReferenceEquals(f.Card, card)) return null;
+        if (DamageProps(props) is not { } flags || !flags.Contains("move")) return null;
+        return f.Id ??= NextAttackId();
+    }
+
+    // AfterAttack(combatState, choiceContext, command). Prefix, so the frame is closed before
+    // any listener's own follow-up damage runs.
+    private static void AttackClosed(object __2)
+    {
+        try
+        {
+            var at = OpenAttacks.FindLastIndex(x => ReferenceEquals(x.Command, __2));
+            if (at < 0) return;
+            var f = OpenAttacks[at];
+            // Anything above it never saw its AfterAttack (a throw), so it goes too.
+            OpenAttacks.RemoveRange(at, OpenAttacks.Count - at);
+
+            // One inner list per hit, per the game's own doc on Results.
+            var hits = Enumerate(Reflect.GetMember(__2, "Results")).Count();
+            if (hits == 0) return;
+            var random = Reflect.GetMember(__2, "IsRandomlyTargeted") is true;
+            var shortOfPlan = f.Planned is int planned && planned != hits;
+            if (hits == 1 && !random && !shortOfPlan) return; // the hit row already says it all
+
+            ReplayRecorder.Line("attack")
+                ?.Set("atk", f.Id)
+                .Set("src", CreatureRef(f.Attacker))
+                .Set("src_cid", CreatureSlots.Maybe(f.Attacker))
+                .Set("card", f.Card == null ? null : Ids.Bare(Reflect.GetString(f.Card, "Id")))
+                .Set("hits", hits)
+                .Set("hits_planned", shortOfPlan ? f.Planned : null)
+                .Set("random", random ? true : (bool?)null)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // AfterModifyingDamageAmount(runState, combatState, cardSource, modifiers). Only caller is
+    // CreatureCmd.Damage, once per target, immediately before BeforeDamageReceived for that
+    // target. Pushed even when empty so the two stay paired.
+    private static void DamageModified(object __3)
+    {
+        try
+        {
+            if (PendingDamageMods.Count > 16) PendingDamageMods.Clear();
+            PendingDamageMods.Push(ModelIds(__3));
+        }
+        catch { }
+    }
+
+    // BeforeDamageReceived(choiceContext, runState, combatState, target, amount, props, dealer,
+    // cardSource). Binds the pending modifiers to the target. The frame is released by that
+    // target's AfterDamageGiven, which Damage fires in a second loop after every target has
+    // been through here, hence frames per target rather than one latch.
+    private static void DamageLanding(object __2, object __3, object __6, object __7)
+    {
+        try
+        {
+            var mods = PendingDamageMods.Count > 0 ? PendingDamageMods.Pop() : null;
+            // Out of combat Damage never fires AfterDamageGiven, so nothing would release it.
+            if (__2 == null || __3 == null) return;
+            OpenDamage.RemoveAll(f => !ReferenceEquals(f.Combat, __2));
+            if (OpenDamage.Count > 32) OpenDamage.Clear();
+            OpenDamage.Add(new DamageFrame
+            {
+                Target = __3, Dealer = __6, Card = __7, Combat = __2, Mods = mods,
+            });
+        }
+        catch { }
+    }
+
+    // AfterModifyingHpLostBeforeOsty / AfterOsty(runState, combatState, modifiers). Both fire
+    // inside the per-target loop after BeforeDamageReceived, so they belong to the most recently
+    // opened frame (a nested call inside that window has already released its own).
+    private static void HpLossModified(object __1, object __2)
+    {
+        try
+        {
+            if (__1 == null || OpenDamage.Count == 0) return;
+            var f = OpenDamage[^1];
+            if (!ReferenceEquals(f.Combat, __1)) return;
+            if (ModelIds(__2) is not { } ids) return;
+            f.HpMods = f.HpMods == null ? ids : f.HpMods.Union(ids).ToList();
+        }
+        catch { }
+    }
+
+    // Release the frame for this blow: the newest one for this target, when its dealer, card
+    // and combat match. When Osty soaks a hit the frame is the original target's, so the Osty
+    // row gets no modifiers and the owner's row gets them.
+    private static DamageFrame? TakeDamageFrame(object combat, object target, object? dealer, object? card)
+    {
+        var at = OpenDamage.FindLastIndex(x => ReferenceEquals(x.Target, target));
+        if (at < 0) return null;
+        var f = OpenDamage[at];
+        if (!ReferenceEquals(f.Combat, combat) || !ReferenceEquals(f.Dealer, dealer)
+            || !ReferenceEquals(f.Card, card)) return null;
+        OpenDamage.RemoveAt(at);
+        return f;
+    }
+
+    // AfterModifyingBlockAmount(combatState, modifiedBlock, cardSource, cardPlay, modifiers).
+    // Only caller is CreatureCmd.GainBlock, which fires AfterBlockGained with the same amount
+    // and card after it, strictly nested around any gain a listener starts.
+    private static void BlockModified(object __0, decimal __1, object __2, object __4)
+    {
+        try
+        {
+            OpenBlock.RemoveAll(f => !ReferenceEquals(f.Combat, __0));
+            if (OpenBlock.Count > 16) OpenBlock.Clear();
+            OpenBlock.Add(new BlockFrame { Combat = __0, Card = __2, Amount = __1, Mods = ModelIds(__4) });
+        }
+        catch { }
+    }
+
+    private static List<string>? TakeBlockMods(object combat, decimal amount, object? card)
+    {
+        var at = OpenBlock.FindLastIndex(x => ReferenceEquals(x.Combat, combat)
+                                              && x.Amount == amount && ReferenceEquals(x.Card, card));
+        if (at < 0) return null;
+        var mods = OpenBlock[at].Mods;
+        OpenBlock.RemoveRange(at, OpenBlock.Count - at);
+        return mods;
+    }
+
     // --- block -----------------------------------------------------------------------
     //
     // One row kind for the whole of block, gains and losses together, because the only question
@@ -2024,15 +2301,18 @@ internal static class ReplayHooks
     private static readonly ConditionalWeakTable<object, object> BlockBeforeClear = new();
 
     // AfterBlockGained(combatState, creature, amount, props, cardSource)
-    private static void BlockGained(object __1, decimal __2, object __4)
+    private static void BlockGained(object __0, object __1, decimal __2, object __4)
     {
         try
         {
+            var mods = TakeBlockMods(__0, __2, __4); // attacks: see the attacks section
+
             // Monster block is recorded too. This used to return early for anything but the
             // player, so a monster that spent its turn gaining Block left nothing in the
             // journal at all and the turn read as "nothing recorded".
             BlockRow(__1, (int)__2, "gained")
                 ?.Set("card", __4 == null ? null : Ids.Bare(Reflect.GetString(__4, "Id")))
+                .Set("mods", mods)
                 .Emit();
         }
         catch { }
