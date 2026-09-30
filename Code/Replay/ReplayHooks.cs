@@ -19,6 +19,8 @@ internal static class ReplayHooks
     private static bool _keywordsResolved;
 
     private const string EnchantSelectType = "deck_select_enchant";
+    private const string TransformSelectType = "deck_select_transform";
+    private const string UpgradeSelectType = "deck_select_upgrade";
 
     private static int _pendingReroll;
 
@@ -2410,9 +2412,11 @@ internal static class ReplayHooks
         try
         {
             ReplayRecorder.MarkDeckChanged();
+            var offered = _decisionType == UpgradeSelectType;
             ReplayRecorder.Line("upgrade")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
-                .Set("option_index", SelectIndexOf(__0))
+                ?.Set("decision_id", _decision > 0 && (offered || _decisionType is "event" or "rest")
+                    ? _decision : (int?)null)
+                .Set("option_index", offered ? SelectIndexOf(__0) : null)
                 .Set("c", CardInstances.Of(__0))
                 .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
                 .Emit();
@@ -2464,9 +2468,11 @@ internal static class ReplayHooks
         _transformFrom = null;
         try
         {
+            var offered = _decisionType == TransformSelectType;
             ReplayRecorder.Line("transform")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
-                .Set("option_index", SelectIndexOf(from))
+                ?.Set("decision_id", _decision > 0 && (offered || _decisionType is "event" or "rest")
+                    ? _decision : (int?)null)
+                .Set("option_index", offered ? SelectIndexOf(from) : null)
                 .Set("from_c", from == null ? (int?)null : CardInstances.Of(from))
                 .Set("from_id", Ids.Bare(Reflect.GetString(from, "Id")))
                 .Set("to_c", CardInstances.Of(__instance))
