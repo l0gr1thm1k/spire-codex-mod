@@ -192,6 +192,8 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.PatchOn(harmony, cardCmd, "ClearAffliction", me, nameof(AfflictionCleared), 1,
                                  firstParamType: "CardModel");
         attempted++; n += HookPatcher.Patch(harmony, hook, "ShouldPlay", me, nameof(PlayRefused), postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "MoveToResultPileWithoutPlaying", me, nameof(AutoPlayDeclined), 2);
         _autoPlayType = HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Cards.AutoPlayType");
 
         attempted++; n += HookPatcher.PatchOn(harmony,
@@ -1186,18 +1188,38 @@ internal static class ReplayHooks
         catch { }
     }
 
+    private static object? _vetoedCard;
+    private static object? _vetoPreventer;
+    private static int _vetoAutoType;
+
     private static void PlayRefused(bool __result, object __1, object? __2, int __3)
     {
         if (__result || __3 == 0) return;
+        _vetoedCard = __1;
+        _vetoPreventer = __2;
+        _vetoAutoType = __3;
+    }
+
+    private static void AutoPlayDeclined(object __1)
+    {
         try
         {
+            var vetoed = ReferenceEquals(__1, _vetoedCard);
+            var reason = Enumerate(Reflect.GetMember(__1, "Keywords"))
+                             .Any(k => k?.ToString() == "Unplayable") ? "unplayable"
+                : vetoed ? "blocked"
+                : "no_target";
+            if (vetoed) _vetoedCard = null;
+            var blocked = reason == "blocked";
+            var kind = blocked && _autoPlayType != null ? Enum.GetName(_autoPlayType, _vetoAutoType) : null;
             var origin = CardInstances.DeckIdOf(__1);
-            var kind = _autoPlayType == null ? null : Enum.GetName(_autoPlayType, __3);
             ReplayRecorder.Line("play_blocked")
                 ?.Set("c", CardInstances.Of(__1))
                 .Set("deck_c", origin > 0 ? origin : (int?)null)
                 .Set("id", Ids.Bare(Reflect.GetString(__1, "Id")))
-                .Set("preventer", Ids.Bare(Reflect.GetString(__2, "Id")))
+                .Set("up", Reflect.GetInt(__1, "CurrentUpgradeLevel", 0))
+                .Set("reason", reason)
+                .Set("preventer", blocked ? Ids.Bare(Reflect.GetString(_vetoPreventer, "Id")) : null)
                 .Set("auto_type", kind?.ToLowerInvariant())
                 .Set("mine", Mine(Reflect.GetMember(__1, "Owner")))
                 .Emit();
