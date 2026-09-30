@@ -449,8 +449,48 @@ internal static class ReplayHooks
         // Deck mutations that instance lineage depends on.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
                                  "Upgrade", me, nameof(CardUpgraded), 2, firstParamType: "CardModel");
-        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
-                                 "Transform", me, nameof(CardTransformed), 3, firstParamType: "CardModel");
+
+        // --- transforms ---
+        //
+        // CardCmd.Transform(IEnumerable<CardTransformation>, Rng?, style) is the one funnel every
+        // transform in the game reaches: Transform(original, replacement) and TransformToRandom
+        // both wrap their card in a one-element sequence and call it. It used to be patched from
+        // the outside on the (CardModel, CardModel) overload instead, which reaches 11 of the
+        // game's 22 transform call sites and misses the other 11 -- Claws, Leafy Poultice and
+        // Pandora's Box go to the bulk overload directly, and the eight TransformToRandom callers
+        // (New Leaf, Entropy, Morphic Grove, Symbiote, Trial, Whispering Hollow, Aroma of Chaos,
+        // Endless Conveyor) do not match its name. Measured across the 953 journals: 420 cards turn up in a deck listing with no row
+        // anywhere saying how they got there, over 191 deck-to-deck transitions in 47 files, and
+        // every single one sits beside an unexplained departure. One Claws visit turning six cards
+        // into six MAULs accounts for twelve of them and emitted nothing at all.
+        //
+        // The bulk overload itself is not patchable from either end. A prefix cannot see the
+        // replacements: the random ones do not exist yet (GetReplacement runs inside the loop),
+        // and walking the argument to find the rest would be actively destructive -- Pandora's
+        // Box passes a lazy Select whose selector calls CardFactory.CreateRandomCardForTransform
+        // off Rng.Niche, so enumerating it here would advance the run's RNG and hand the game a
+        // different deck than the one we recorded. A postfix is the async trap documented on
+        // FromDeckGeneric above: the method is `async Task<IEnumerable<CardPileAddResult>>`, so
+        // __result is the Task and the pairs are a local array we never see.
+        //
+        // So patch the pair of notifications the loop itself calls per transformation:
+        // `original.AfterTransformedFrom(); replacement.AfterTransformedTo();`, back to back with
+        // no await between them. That lands AFTER Hook.ModifyCardBeingAddedToDeck has had its say
+        // and after the replacement is in its pile, which makes it a better row than the old site
+        // on two counts beyond coverage. It only fires for a transform that actually happened
+        // (the old prefix also emitted for the ones CombatManager.IsEnding silently drops), and
+        // to_c names the object that really entered the deck -- Frozen, Molten and Toxic Egg and
+        // Fresnel Lens all answer ModifyCardBeingAddedToDeck with RunState.CloneCard(card), so
+        // with one of those in play the replacement the old site named was thrown away and its
+        // id never appeared again.
+        //
+        // These two replace the old CardCmd.Transform prefix rather than joining it: that
+        // overload delegates here, so keeping both would emit every single-card transform twice.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Models.CardModel"),
+                                 "AfterTransformedFrom", me, nameof(TransformedFrom), 0);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Models.CardModel"),
+                                 "AfterTransformedTo", me, nameof(TransformedTo), 0);
+
         // Enchantment has no hook at all: Hook.cs names Enchantment only to read damage and
         // block modifiers. CardCmd.Enchant is the patch point instead, and it is the right one
         // on three counts. It is SYNCHRONOUS, returning EnchantmentModel? rather than a Task,
@@ -2658,21 +2698,41 @@ internal static class ReplayHooks
         return (type ?? "unknown").ToLowerInvariant();
     }
 
-    // Transform genuinely swaps objects, so this is the one place the lineage thread would
-    // break. Both are in scope here, so the link is explicit.
-    private static void CardTransformed(object __0, object __1)
+    // The original of the transformation the game is applying right now.
+    //
+    // Safe as a single slot because CardCmd.Transform's loop calls AfterTransformedFrom on the
+    // original and AfterTransformedTo on the replacement adjacently, with no await and no other
+    // call between them, so neither another transformation in the same batch nor another batch
+    // can interleave. Consumed and cleared by TransformedTo, which is what makes a missed From
+    // cost a from_c instead of mis-pairing one: the only shipped override,
+    // SovereignBlade.AfterTransformedFrom, does not call base, so a forged blade transformed away
+    // emits the row with its `from` half absent rather than pointing at the previous card.
+    private static object? _transformFrom;
+
+    private static void TransformedFrom(object __instance)
     {
+        _transformFrom = __instance;
+    }
+
+    // Transform genuinely swaps objects, so this is the one place the lineage thread would
+    // break. Written from the replacement's side because that is where both halves are final.
+    private static void TransformedTo(object __instance)
+    {
+        var from = _transformFrom;
+        _transformFrom = null;
         try
         {
             ReplayRecorder.Line("transform")
                 ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
                 // The option index belongs to the card that was CHOSEN, which is the one that
                 // was on offer; the replacement was never in the deck when the select opened.
-                .Set("option_index", SelectIndexOf(__0))
-                .Set("from_c", CardInstances.Of(__0))
-                .Set("from_id", Ids.Bare(Reflect.GetString(__0, "Id")))
-                .Set("to_c", CardInstances.Of(__1))
-                .Set("to_id", Ids.Bare(Reflect.GetString(__1, "Id")))
+                .Set("option_index", SelectIndexOf(from))
+                // Explicitly null rather than CardInstances.Of(null), which is the 0 sentinel and
+                // would read downstream as a real instance id.
+                .Set("from_c", from == null ? (int?)null : CardInstances.Of(from))
+                .Set("from_id", Ids.Bare(Reflect.GetString(from, "Id")))
+                .Set("to_c", CardInstances.Of(__instance))
+                .Set("to_id", Ids.Bare(Reflect.GetString(__instance, "Id")))
                 .Emit();
         }
         catch { }

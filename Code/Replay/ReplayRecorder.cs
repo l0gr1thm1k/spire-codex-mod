@@ -716,18 +716,145 @@ public static class ReplayRecorder
                     ? null : Core.Ids.Bare(Reflect.GetString(enchantment, "Id"));
                 var amount = enchantment == null
                     ? 0 : Reflect.GetInt(enchantment, "Amount", 0);
+                // The floor this card entered the deck on. Nullable on the game's side and read
+                // as such: an unreadable member and floor 0 must not become the same value, and
+                // Reflect.GetInt's fallback would have made them so. In practice the game writes
+                // 1 for everything the run starts with (Player.cs and AscensionManager set it
+                // directly) and TotalFloor for everything added later, so it is present for deck
+                // cards while the cards a run opens with simply share one, which is honest: those
+                // are interchangeable. It is written once on the add, never touched again, and
+                // CardModel's save round-trip restores it, which is what makes it usable as a
+                // reload-stable discriminator where the saved properties below are not.
+                var addedFloor = Reflect.GetMember(card, "FloorAddedToDeck") is int floor
+                    ? floor : (int?)null;
                 rows.Add(new ReplayLine("c")
                     .Set("c", instance)
                     .Set("id", cardId)
                     .Set("up", up)
                     .Set("enchantment", enchantId)
-                    .Set("amount", enchantment == null ? (int?)null : amount));
+                    .Set("amount", enchantment == null ? (int?)null : amount)
+                    .Set("added_floor", addedFloor)
+                    .Set("state", CardState(card)));
                 entries.Add(new DeckRemap.Entry(
-                    instance, ReplayJournalScan.Key(cardId, up, enchantId, amount)));
+                    instance, ReplayJournalScan.Key(cardId, up, enchantId, amount),
+                    ReplayJournalScan.Tag(addedFloor)));
             }
         }
         catch { }
         return rows;
+    }
+
+    // Per-instance card state, as a nested object on the deck listing entry.
+    //
+    // Genetic Algorithm's accumulated block and The Scythe's accumulated damage live on the card
+    // INSTANCE, not on its type, so two copies in one deck can differ by the only thing that
+    // makes either of them worth anything and (id, up, enchantment, amount) says they are the
+    // same card. Guilty's CombatsSeen, Spoils Map's act and Mad Science's stored Tinker Time are
+    // the same shape.
+    //
+    // Found by ATTRIBUTE, not by name. The game marks exactly this state with
+    // MegaCrit.Sts2.Core.Saves.Runs.SavedPropertyAttribute because it is what has to survive a
+    // save, so reading the attribute covers every such card without this file naming any of them,
+    // today's five and whatever gets added later. It also stays clean: CardModel declares no
+    // [SavedProperty] of its own -- upgrade level, enchantment and FloorAddedToDeck are written by
+    // ToSerializable by hand -- so everything this finds was declared by a concrete card type and
+    // is genuinely per-instance. Nothing generic leaks in and duplicates a column the row already
+    // has.
+    //
+    // On the LISTING rather than on a row of its own, for the same reason `up` and `enchantment`
+    // are stated here instead of being re-threaded from earlier rows: a reload destroys the object
+    // identity those earlier rows name, and reading the live card answers the question outright.
+    // There is also no funnel to hang a per-change row on -- these are plain property setters on
+    // five unrelated card types, so it would be five patches that a new card silently defeats,
+    // where this is one generic read. The cost is granularity: the listing refreshes when the deck
+    // changes, so `state` is the value as of this row and a consumer must not read it as current
+    // between listings.
+    private static ReplayLine? CardState(object card)
+    {
+        var props = SavedPropertiesOf(card.GetType());
+        if (props.Length == 0) return null;
+        ReplayLine? row = null;
+        foreach (var p in props)
+        {
+            object? value;
+            // A getter that throws reads as absent. Never a 0 stand-in: the whole point of the
+            // field is that the number differs between two copies, so a fabricated one is worse
+            // than no field at all.
+            try { value = p.GetValue(card); }
+            catch { continue; }
+            if (value == null) continue;
+            (row ??= new ReplayLine("state", props.Length)).Set(Snake(p.Name), value);
+        }
+        return row;
+    }
+
+    private static readonly Dictionary<Type, System.Reflection.PropertyInfo[]> SavedProps = new();
+    private static Type? _savedPropertyAttr;
+    private static bool _savedPropertyAttrTried;
+
+    // Resolved once per card TYPE. GetProperties plus an attribute scan for every deck card on
+    // every listing would be the reflective walk DeckSignature goes out of its way to avoid; a
+    // dictionary lookup on the type is free, and most cards resolve to an empty array and cost
+    // nothing further. Sorted by name so the nested object's field order is stable across builds
+    // rather than following whatever order the runtime happens to report.
+    private static System.Reflection.PropertyInfo[] SavedPropertiesOf(Type type)
+    {
+        lock (SavedProps)
+        {
+            if (SavedProps.TryGetValue(type, out var known)) return known;
+            var found = Array.Empty<System.Reflection.PropertyInfo>();
+            try
+            {
+                if (!_savedPropertyAttrTried)
+                {
+                    _savedPropertyAttrTried = true;
+                    _savedPropertyAttr = HookPatcher.FindType(
+                        "MegaCrit.Sts2.Core.Saves.Runs.SavedPropertyAttribute");
+                    // Said out loud rather than degrading quietly: a rename here makes `state`
+                    // vanish from every deck row, which looks exactly like a deck of cards that
+                    // happen to carry no per-instance state.
+                    if (_savedPropertyAttr == null)
+                        MainFile.Logger.Info(
+                            "replay: SavedPropertyAttribute not found; card state omitted");
+                }
+                if (_savedPropertyAttr != null)
+                {
+                    var hits = new List<System.Reflection.PropertyInfo>();
+                    foreach (var p in type.GetProperties(
+                                 System.Reflection.BindingFlags.Public
+                                 | System.Reflection.BindingFlags.NonPublic
+                                 | System.Reflection.BindingFlags.Instance))
+                    {
+                        if (p.GetIndexParameters().Length > 0) continue;
+                        if (Attribute.GetCustomAttribute(p, _savedPropertyAttr) == null) continue;
+                        hits.Add(p);
+                    }
+                    hits.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+                    found = hits.ToArray();
+                }
+            }
+            catch { }
+            SavedProps[type] = found;
+            return found;
+        }
+    }
+
+    // IncreasedBlock -> increased_block, so the field reads like the rest of the journal while
+    // still naming the game property it came from.
+    private static string Snake(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length + 4);
+        for (var i = 0; i < name.Length; i++)
+        {
+            var ch = name[i];
+            if (char.IsUpper(ch))
+            {
+                if (i > 0) sb.Append('_');
+                sb.Append(char.ToLowerInvariant(ch));
+            }
+            else sb.Append(ch);
+        }
+        return sb.ToString();
     }
 
     // Close the open journal, if any. Runs the close off the caller's thread so a producer

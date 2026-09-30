@@ -186,10 +186,15 @@ public static class ReplayJournalScan
                 // comparable against a live deck that has it, so refuse the whole listing.
                 if (!card.TryGetProperty("up", out var up) || up.ValueKind != JsonValueKind.Number)
                     return Empty(rows);
+                // `added_floor` is optional, unlike `up`. It is not part of the key, so a listing
+                // without it still aligns exactly as it did before; its absence just leaves the
+                // entry untagged, which DeckRemap reads as "unknown" rather than "different".
                 rows.Add(new DeckRemap.Entry(c.GetInt32(), Key(
                     Text(card, "id"), up.GetInt32(), Text(card, "enchantment"),
                     card.TryGetProperty("amount", out var amt)
-                        && amt.ValueKind == JsonValueKind.Number ? amt.GetInt32() : 0)));
+                        && amt.ValueKind == JsonValueKind.Number ? amt.GetInt32() : 0),
+                    Tag(card.TryGetProperty("added_floor", out var floor)
+                        && floor.ValueKind == JsonValueKind.Number ? floor.GetInt32() : (int?)null)));
             }
         }
         catch { return Empty(rows); }
@@ -200,6 +205,14 @@ public static class ReplayJournalScan
     // the recorder, because two spellings of the same key align nothing.
     public static string Key(string? id, int up, string? enchantment, int amount)
         => $"{id}|{up}|{enchantment}|{amount}";
+
+    // The tag half of a deck entry, spelled here for the same reason Key is: the stored side and
+    // the live side have to agree character for character or they align nothing. Prefixed so a
+    // second component can be added later without a bare number silently colliding with it.
+    public static string? Tag(int? addedFloor)
+        => addedFloor == null
+            ? null
+            : "f" + addedFloor.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
     private static List<DeckRemap.Entry> Empty(List<DeckRemap.Entry> rows)
     {
