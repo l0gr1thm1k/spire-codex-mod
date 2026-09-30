@@ -663,9 +663,15 @@ internal static class ReplayHooks
             "SetEventState", me, nameof(EventPageShown), 2, postfix: true);
         // A visit restarts page numbering. BeginEvent, not SetInitialEventState: AncientEventModel
         // OVERRIDES the latter, so a base patch would miss every Ancient and Neow itself.
-        attempted++; n += HookPatcher.PatchOn(harmony,
-            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.EventModel"),
-            "BeginEvent", me, nameof(EventBegun), 2);
+        // v0.111.0 declares BeginEvent(Player, EventCombatSynchronizer?, bool), three arguments;
+        // the two-argument form is kept for builds without the synchronizer. EventBegun reads
+        // only the Player, so either shape serves. Without this patch page_index never resets
+        // and every event after the first opens on a page number carried from the last one.
+        var eventModel = HookPatcher.FindType("MegaCrit.Sts2.Core.Models.EventModel");
+        var beginEventArgs = eventModel?.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Any(m => m.Name == "BeginEvent" && m.GetParameters().Length == 3) == true ? 3 : 2;
+        attempted++; n += HookPatcher.PatchOn(harmony, eventModel,
+            "BeginEvent", me, nameof(EventBegun), beginEventArgs);
         // The execution half. ChooseOptionForEvent is where an index becomes the option that
         // runs, for the local click and for a peer's, so it is the one place that carries both
         // the Player and the slot the option occupied. PREFIX: it calls EventOption.Chosen(),
@@ -786,7 +792,8 @@ internal static class ReplayHooks
         // the shown numbers moved. See the intents section for the rest.
         attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeSideTurnStart", me, nameof(IntentTurnStarting));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPlayerTurnStart", me, nameof(IntentsShown));
-        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeTurnEnd", me, nameof(IntentsCommitted));
+        // v0.111.0 names it BeforeSideTurnEnd; same (combatState, side, participants) arguments.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeTurnEnd|BeforeSideTurnEnd", me, nameof(IntentsCommitted));
         attempted++; n += HookPatcher.PatchOn(harmony,
             HookPatcher.FindType("MegaCrit.Sts2.Core.Models.MonsterModel"),
             "SetMoveImmediate", me, nameof(MoveSetImmediate), 2);
@@ -4573,7 +4580,7 @@ internal static class ReplayHooks
     private static PropertyInfo? _optProceedProp;
     private static MethodInfo? _addVarsMethod;
 
-    // EventModel.BeginEvent(Player player, bool isPreFinished) prefix. One visit, one page
+    // EventModel.BeginEvent(Player player, [EventCombatSynchronizer?,] bool isPreFinished) prefix. One visit, one page
     // numbering.
     //
     // Owner is assigned inside BeginEvent, so the local check reads the Player argument instead.
@@ -4956,7 +4963,7 @@ internal static class ReplayHooks
         catch { }
     }
 
-    // Hook.BeforeTurnEnd(ICombatState combatState, CombatSide side, participants). The
+    // Hook.BeforeSideTurnEnd(ICombatState combatState, CombatSide side, participants). The
     // player's side only: what they ended the turn against, where it differs from the last
     // row for that enemy (Weak applied, Strength gained, a move swapped).
     private static void IntentsCommitted(object __0, object __1)
