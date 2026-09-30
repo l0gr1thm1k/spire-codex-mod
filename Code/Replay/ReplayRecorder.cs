@@ -139,6 +139,8 @@ public static class ReplayRecorder
                     .Set("hp", snapshot.CurrentHp)
                     .Set("gold", snapshot.Gold)
                     .Set("deck_size", snapshot.DeckSize)
+                    .Set("relics", HeldRelics())
+                    .Set("potions", PotionBelt())
                     .Set("rng_state", RngState.Read())
                     .Emit();
             if (journal.Resumed) EmitDeckRemap(journal);
@@ -196,6 +198,8 @@ public static class ReplayRecorder
             .Set("reloads", Reloads())
             .Set("starting_deck", StartingDeck())
             .Set("starting_relics", s.Relics.Select(r => r.Id).ToList())
+            .Set("relics", HeldRelics())
+            .Set("potions", PotionBelt())
             .Set("rng_state", RngState.Read())
             .Emit();
     }
@@ -486,6 +490,71 @@ public static class ReplayRecorder
         }
         catch { }
         return rows;
+    }
+
+    private static List<ReplayLine>? HeldRelics()
+    {
+        try
+        {
+            if (Reflect.GetMember(Core.Sts2Access.LivePlayer, "Relics") is not System.Collections.IEnumerable relics)
+                return null;
+            var rows = new List<ReplayLine>();
+            foreach (var relic in relics)
+            {
+                if (relic == null) continue;
+                rows.Add(new ReplayLine("r")
+                    .Set("id", Core.Ids.Bare(Reflect.GetString(relic, "Id")))
+                    .Set("state", RelicState(relic)));
+            }
+            return rows;
+        }
+        catch { return null; }
+    }
+
+    private static ReplayLine? RelicState(object relic)
+    {
+        var props = SavedPropertiesOf(relic.GetType());
+        if (props.Length == 0) return null;
+        ReplayLine? row = null;
+        foreach (var p in props)
+        {
+            object? value;
+            try { value = StateValue(p.GetValue(relic)); }
+            catch { continue; }
+            if (value == null) continue;
+            if (value is false && p.DeclaringType?.Name == "RelicModel") continue;
+            (row ??= new ReplayLine("state", props.Length)).Set(Snake(p.Name), value);
+        }
+        return row;
+    }
+
+    private static object? StateValue(object? value) => value switch
+    {
+        null => null,
+        string or bool or int or long or decimal or double or float => value,
+        System.Collections.IEnumerable list => list.Cast<object?>()
+            .Select(StateValue).OfType<string>().ToList(),
+        _ when value.GetType().Name == "ModelId" => Core.Ids.Bare(value.ToString()),
+        _ => Core.Ids.Bare(Reflect.GetString(value, "Id")) ?? value.ToString(),
+    };
+
+    private static List<ReplayLine>? PotionBelt()
+    {
+        try
+        {
+            if (Reflect.GetMember(Core.Sts2Access.LivePlayer, "PotionSlots") is not System.Collections.IEnumerable slots)
+                return null;
+            var rows = new List<ReplayLine>();
+            var slot = 0;
+            foreach (var potion in slots)
+            {
+                rows.Add(new ReplayLine("p")
+                    .Set("slot", slot++)
+                    .Set("id", potion == null ? null : Core.Ids.Bare(Reflect.GetString(potion, "Id"))));
+            }
+            return rows;
+        }
+        catch { return null; }
     }
 
     private static ReplayLine? CardState(object card)
