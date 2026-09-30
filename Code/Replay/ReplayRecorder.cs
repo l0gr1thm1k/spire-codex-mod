@@ -359,6 +359,20 @@ public static class ReplayRecorder
             // none. Real starting HP is the first hp line, src "heal", at floor 0.
             .Set("game_mode", s.GameMode?.ToLowerInvariant())
             .Set("modifiers", s.Modifiers)
+            // What else is running in this process. `modifiers` names only the custom-run
+            // modifiers, so a run played beside an undo mod, a reward-preview mod or a content
+            // mod read exactly like a vanilla one -- and vanilla StS2 has no mid-combat save
+            // or undo at all (SaveRun fires only at room entry and combat end), so every
+            // taken-back play on a tape is a third party's. `mods` is what the mod loader says
+            // it loaded; `harmony_owners` is who actually patched game code, which does not
+            // depend on a manifest being honest about affectsGameplay. This mod is in both.
+            .Set("mods", LoadedMods())
+            .Set("harmony_owners", HarmonyOwners())
+            // The setting that unlocks the dev console's debug commands outside a modded
+            // session. Recorded, but NOT sufficient on its own: NDevConsole also unlocks them
+            // whenever ModManager.IsRunningModded(), which this mod being loaded makes true.
+            // The `console` row is the witness for what was actually run.
+            .Set("full_console", FullConsole())
             .Set("start_time", startTime)
             .Set("platform_type", "steam")
             .Set("player_count", s.PlayerCount)
@@ -375,6 +389,59 @@ public static class ReplayRecorder
             // reopened, which is the anchor for everything before the first combat_start.
             .Set("rng_state", RngState.Read())
             .Emit();
+    }
+
+    // ModManager.GetLoadedMods(): every mod in state Loaded, one row each. Null, not empty, when
+    // the loader cannot be read, so "no mods" and "could not tell" stay different answers.
+    private static List<ReplayLine>? LoadedMods()
+    {
+        try
+        {
+            var manager = Core.HookPatcher.FindType("MegaCrit.Sts2.Core.Modding.ModManager");
+            var loaded = manager?.GetMethod("GetLoadedMods", System.Type.EmptyTypes)?.Invoke(null, null);
+            if (loaded is not System.Collections.IEnumerable mods) return null;
+            var rows = new List<ReplayLine>();
+            foreach (var mod in mods)
+            {
+                var manifest = Reflect.GetMember(mod, "manifest");
+                rows.Add(new ReplayLine("m")
+                    .Set("id", Reflect.GetString(manifest, "id"))
+                    .Set("version", Reflect.GetString(manifest, "version"))
+                    // The game's own default when a manifest omits it is true, and so is ours.
+                    .SetFlag("affects_gameplay", Reflect.GetBool(manifest, "affectsGameplay", true))
+                    .Set("source", Reflect.GetMember(mod, "modSource")?.ToString()?.ToLowerInvariant()));
+            }
+            return rows;
+        }
+        catch { return null; }
+    }
+
+    // The distinct Harmony ids with a patch on any method, sorted. Null when Harmony refuses to
+    // enumerate, never a guessed empty list.
+    private static List<string>? HarmonyOwners()
+    {
+        try
+        {
+            return HarmonyLib.Harmony.GetAllPatchedMethods()
+                .SelectMany(m => HarmonyLib.Harmony.GetPatchInfo(m)?.Owners
+                                 ?? (IEnumerable<string>)System.Array.Empty<string>())
+                .Distinct()
+                .OrderBy(o => o, System.StringComparer.Ordinal)
+                .ToList();
+        }
+        catch { return null; }
+    }
+
+    // SaveManager.Instance.SettingsSave.FullConsole, or null when it cannot be read.
+    private static bool? FullConsole()
+    {
+        try
+        {
+            var saves = Reflect.GetStatic(
+                Core.HookPatcher.FindType("MegaCrit.Sts2.Core.Saves.SaveManager"), "Instance");
+            return Reflect.GetMember(Reflect.GetMember(saves, "SettingsSave"), "FullConsole") as bool?;
+        }
+        catch { return null; }
     }
 
     // How many times this run has been loaded from a save. The game maintains the counter

@@ -813,6 +813,14 @@ internal static class ReplayHooks
             HookPatcher.FindType("MegaCrit.Sts2.Core.Models.MonsterModel"),
             "SetMoveImmediate", me, nameof(MoveSetImmediate), 2);
 
+        // --- outside the game's rules --------------------------------------------------
+        // The private ProcessCommand(Player, cmdName, args) is the one funnel both a typed
+        // command and a co-op peer's networked command reach, so one prefix sees them all.
+        // firstParamType separates it from the public ProcessCommand(string) overload.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.DevConsole.DevConsole"),
+            "ProcessCommand", me, nameof(ConsoleCommand), 3, firstParamType: "Player");
+
         // Not Harmony patches, so deliberately outside the n/attempted tally: these are plain
         // member lookups whose absence costs two fields on one row, not a whole line kind.
         // The Player argument for the overload match comes from the first pick, so IsMe
@@ -5189,6 +5197,30 @@ internal static class ReplayHooks
         catch { }
         SingleDamageMethods[type] = found;
         return found;
+    }
+
+    // --- outside the game's rules ---------------------------------------------------
+
+    // DevConsole.ProcessCommand(Player? player, string cmdName, string[] args). A console
+    // command runs through the ordinary commands -- `block` is CreatureCmd.GainBlock, `heal` is
+    // CreatureCmd.Heal -- so its effects were already in the journal, as rows with no cause: a
+    // cardless 15 block mid-turn, a +50 heal with no source. Prefix, so this row lands ahead of
+    // them the same way `play` lands ahead of its hits.
+    //
+    // Written for every command attempted, `help` and typos included. Whether the command
+    // exists or succeeded is the game's business; that it was typed during a recorded run is
+    // what a consumer needs, to set the run aside.
+    private static void ConsoleCommand(object? __0, string __1, string[] __2)
+    {
+        try
+        {
+            ReplayRecorder.Line("console")
+                ?.Set("cmd", __1)
+                .Set("args", __2 is { Length: > 0 } ? __2.ToList() : null)
+                .Set("mine", Mine(__0))
+                .Emit();
+        }
+        catch { }
     }
 
     // --- helpers ---------------------------------------------------------------------
