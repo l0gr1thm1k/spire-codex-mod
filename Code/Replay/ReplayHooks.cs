@@ -296,6 +296,32 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterOrbChanneled", me, nameof(OrbChanneled));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterOrbEvoked", me, nameof(OrbEvoked));
 
+        // --- powers ------------------------------------------------------------------
+        // A power LEAVING the board, which no first-party hook reports at all.
+        // PowerModel.RemoveInternal is the one method every departure funnels through:
+        // PowerCmd.Remove calls it, and so does Creature.RemoveAllPowersInternalExcept, which is
+        // what CreatureCmd.Escape, the after-death sweep (RemoveAllPowersAfterDeath) and combat
+        // teardown (Player.AfterCombatEnd, CombatManager.Reset) all go through. Patching
+        // PowerCmd.Remove instead would cover its 71 explicit call sites and miss every one of
+        // those. Concrete and non-virtual on the abstract PowerModel, so one patch covers every
+        // power in the game.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.PowerModel"),
+            "RemoveInternal", me, nameof(PowerRemoved), 0);
+        // The amount a change ASKED for, before the modifiers ran. Stashes, never emits.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforePowerAmountChanged", me, nameof(PowerChanging));
+        // The two places an application that landed nothing is still visible. Both emit only in
+        // the zero case, so neither adds a line where the journal already has one.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.PowerModel"),
+            "ApplyInternal", me, nameof(PowerApplied), 3);
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.History.CombatHistory"),
+            "PowerReceived", me, nameof(PowerReceived), 4);
+        // Not a patch, so outside the n/attempted tally: one type lookup, whose absence costs
+        // one tag on one row kind (see PostCombat).
+        _combatManagerType = HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.CombatManager");
+
         // --- decisions ---------------------------------------------------------------
         // The offer itself, with one option row per card and its selectability. Postfix on
         // Populate: the cards exist only after it runs.
@@ -1290,21 +1316,265 @@ internal static class ReplayHooks
         try
         {
             var owner = Reflect.GetMember(__2, "Owner");
-            ReplayRecorder.Line("power")
-                // Who applied it. Without this a relic or thorns ticking on the enemy turn
-                // looked identical to a monster buffing itself, because tgt was the only clue.
-                // Same convention as hit.src: a null applier is an effect, not a failed read.
-                ?.Set("src", CreatureRef(__4))
+            var line = ReplayRecorder.Line("power");
+            if (line == null) return;
+            var src = CreatureRef(__4);
+            var landed = (int)__3;
+            // Who applied it. Without this a relic or thorns ticking on the enemy turn looked
+            // identical to a monster buffing itself, because tgt was the only clue. Same
+            // convention as hit.src: a null applier is an effect, not a failed read.
+            line.Set("src", src)
                 .Set("src_cid", CreatureSlots.Maybe(__4))
                 .Set("id", Ids.Bare(Reflect.GetString(__2, "Id")))
-                .Set("n", (int)__3)
+                .Set("n", landed)
+                // The RESULTING TOTAL, not a second delta. `n` is the change alone
+                // (modifiedOffset in PowerCmd.ModifyAmount, modifiedAmount in Apply), so a
+                // consumer summing deltas drifts permanently the moment one row is missed --
+                // and a row IS missed every time an application is modified to zero. Amount is
+                // the number the game itself carries on the power, so every row restates the
+                // board and the drift cannot accumulate.
+                .Set("amount", AmountOf(__2))
+                // What was asked for before the modifiers, written only when it differs from
+                // what landed. Unsettling Lamp doubles a debuff and Ruined Helmet doubles the
+                // first Strength of a fight, and today the journal shows only the doubled
+                // figure. Equal amounts are the overwhelming majority and write nothing, which
+                // is why the before hook does not get a row of its own.
+                .Set("n_intended", IntendedAmount(__2, src) is { } asked && asked != landed
+                        ? asked : (int?)null)
+                // Deliberately ModelId, so the player reads as IRONCLAD rather than "player".
+                // Unchanged because released readers parse it, and power_lost / power_negated
+                // below follow it for the same reason.
                 .Set("tgt", Ids.Bare(Reflect.GetString(owner, "ModelId")))
                 // Which body carries the debuff. `tgt` alone said CORPSE_SLUG for a Weak that
                 // only one of the two slugs actually had.
-                .Set("tgt_cid", CreatureSlots.Maybe(owner))
-                .Emit();
+                .Set("tgt_cid", CreatureSlots.Maybe(owner));
+            StampInstance(line, __2);
+            line.Emit();
         }
         catch { }
+    }
+
+    // BeforePowerAmountChanged(combatState, PowerModel, amount, target, applier, cardSource).
+    //
+    // Emits NOTHING by itself. It fires on every amount change in the game, 64237 rows' worth in
+    // the recorded corpus, so a row here would double the largest combat line kind in the file to
+    // restate what the after row already says. What it is for is the number that exists ONLY
+    // here: the amount before Hook.ModifyPowerAmountGiven / ModifyPowerAmountReceived touched it.
+    // Two rows need it -- a power row whose landed amount was changed on the way in, and the
+    // negation rows below, where PowerCmd guards the after hook behind a non-zero check and the
+    // whole event otherwise vanishes.
+    //
+    // PREFIX on an async Task hook, deliberately: the body awaits every listener's own
+    // BeforePowerAmountChanged, and the intent has to be stashed before any of them can modify
+    // the power it is about.
+    private static void PowerChanging(object __1, decimal __2, object __4, object __5)
+    {
+        try
+        {
+            if (__1 == null) return;
+            Intents.Remove(__1);
+            Intents.Add(__1, new Intent
+            {
+                Amount = (int)__2,
+                Src = CreatureRef(__4),
+                SrcCid = CreatureSlots.Maybe(__4),
+                Card = __5 == null ? null : Ids.Bare(Reflect.GetString(__5, "Id")),
+            });
+        }
+        catch { }
+    }
+
+    // PowerModel.ApplyInternal(Creature owner, decimal amount, bool silent).
+    //
+    // Half of "I applied Weak and it did not land". PowerCmd.Apply calls this unconditionally
+    // once target.CanReceivePowers, while the row-producing Hook.AfterPowerAmountChanged sits
+    // behind `if (modifiedAmount != 0m)`, and ApplyInternal itself no-ops on a zero amount. So a
+    // zero here is exactly a fresh power negated on the way in (Artifact eating a debuff), and
+    // nothing else in the game reports it: today that reads identically to never applying it.
+    //
+    // Only the zero case emits, so a normal application still has exactly one row.
+    private static void PowerApplied(object __instance, object __0, decimal __1)
+    {
+        try
+        {
+            if (__1 != 0m) return;
+            // Not on the board and never will be: PowerCmd.Apply built this instance for an
+            // application that landed nothing, so it gets no pid (an id minted here would name a
+            // power that never existed) and no amount. The applier is read off the power because
+            // Apply sets power.Applier one line before the before hook runs.
+            EmitNegated(__instance, __0, Reflect.GetMember(__instance, "Applier"), onBoard: false);
+        }
+        catch { }
+    }
+
+    // CombatHistory.PowerReceived(ICombatState, PowerModel, decimal amount, Creature? applier).
+    //
+    // The other half. When the target ALREADY carries the power, PowerCmd.Apply hands off to
+    // ModifyAmount, which guards Hook.AfterPowerAmountChanged behind `(int)modifiedOffset != 0`
+    // while calling History.PowerReceived one line earlier with no guard at all. That unguarded
+    // call is the only witness to an offset the modifiers ate.
+    //
+    // The int cast here is the game's own test for "no after row will follow", used so the two
+    // can never disagree. PowerCmd.Apply also calls PowerReceived, but only when its amount is
+    // non-zero, so the fresh-application path never reaches the emit. A caller that genuinely
+    // asks for an offset of 0 lands here too and says so: n_intended is then 0.
+    private static void PowerReceived(object __1, decimal __2, object __3)
+    {
+        try
+        {
+            if ((int)__2 != 0) return;
+            EmitNegated(__1, Reflect.GetMember(__1, "Owner"), __3, onBoard: true);
+        }
+        catch { }
+    }
+
+    // One shape for both negation paths: an application that reached its target and changed
+    // nothing. "I applied Weak and Artifact ate it" and "I never applied Weak" are the same
+    // journal today, and grading a debuff plan needs them apart.
+    //
+    // `n_intended` is the point of the row, so it comes from the intent stashed at
+    // BeforePowerAmountChanged rather than from anything re-derived here. There is no `n`: a 0
+    // delta would be indistinguishable from a row that simply did not record one.
+    private static void EmitNegated(object? power, object? target, object? applier, bool onBoard)
+    {
+        var line = ReplayRecorder.Line("power_negated");
+        if (line == null) return;
+        Intent? intent = null;
+        if (power != null) Intents.TryGetValue(power, out intent);
+        line.Set("src", intent?.Src ?? CreatureRef(applier))
+            .Set("src_cid", intent?.SrcCid ?? CreatureSlots.Maybe(applier))
+            .Set("id", Ids.Bare(Reflect.GetString(power, "Id")))
+            .Set("n_intended", intent?.Amount)
+            .Set("card", intent?.Card)
+            .Set("tgt", Ids.Bare(Reflect.GetString(target, "ModelId")))
+            .Set("tgt_cid", CreatureSlots.Maybe(target));
+        // The target already carried this instance, so there is a real board position to point
+        // at and to restate the total of. A negated FRESH application has neither.
+        if (onBoard)
+        {
+            line.Set("amount", AmountOf(power));
+            StampInstance(line, power);
+        }
+        line.Emit();
+    }
+
+    // PowerModel.RemoveInternal(). The board LOSING a power.
+    //
+    // Nothing reported this, so a consumer replaying power deltas accumulated a board that only
+    // ever grew: "did the enemy still have Vulnerable when I hit it" is the question these rows
+    // exist for and it was unanswerable. 64237 power rows depend on it.
+    //
+    // PREFIX, because RemoveInternal's last act is Owner.RemovePowerInternal(this) and a postfix
+    // would be reading the owner off a power the game has already unhooked. It happens to still
+    // read today, since RemovePowerInternal does not clear _owner, and that is an implementation
+    // detail rather than a contract.
+    private static void PowerRemoved(object __instance)
+    {
+        try
+        {
+            // The duration tick is ALREADY recorded and must not be recorded twice.
+            // PowerCmd.ModifyAmount fires AfterPowerAmountChanged with the negative offset and
+            // only then calls Remove, so Vulnerable reaching 0 already has a power row whose
+            // amount is 0. ShouldRemoveDueToAmount is the game's own predicate for that branch,
+            // so asking it is asking "did the row that already went out explain this removal".
+            // A failed read falls through to emitting: the duplicate costs a line whose n is 0,
+            // a missing row costs the answer.
+            if (Reflect.Call(__instance, "ShouldRemoveDueToAmount") is true) return;
+            var owner = Reflect.GetMember(__instance, "Owner");
+            var line = ReplayRecorder.Line("power_lost");
+            if (line == null) return;
+            var held = AmountOf(__instance);
+            line.Set("id", Ids.Bare(Reflect.GetString(__instance, "Id")))
+                // Same two fields as a power row and the same meanings: `n` is the delta, and
+                // `amount` is the total it lands on. The instance is gone, so the total is 0
+                // whatever the amount read did, and `n` is omitted rather than guessed when the
+                // amount could not be read.
+                .Set("n", held is { } a ? -a : (int?)null)
+                .Set("amount", 0)
+                .Set("tgt", Ids.Bare(Reflect.GetString(owner, "ModelId")))
+                .Set("tgt_cid", CreatureSlots.Maybe(owner))
+                // Why the board changed, where it is readable off the two objects already in
+                // hand. A death sweep and a combat teardown are bulk wipes a consumer will want
+                // to treat differently from Expose stripping one Artifact, and neither is
+                // inferable from a removal row alone. Both are omitted rather than defaulted:
+                // untagged means "could not tell", never "no". There is no `src` at all -- the
+                // funnel takes no applier, so who removed it is genuinely not in scope here.
+                .Set("dead", Reflect.GetMember(owner, "IsAlive") is false ? (object)true : null)
+                .Set("post_combat", PostCombat());
+            StampInstance(line, __instance);
+            line.Emit();
+        }
+        catch { }
+    }
+
+    // PowerModel.Amount, or null when it cannot be read. Never 0 as a stand-in: `amount` is read
+    // as the board's current total, where 0 says the power is gone.
+    private static int? AmountOf(object? power)
+        => Reflect.GetMember(power, "Amount") is int a ? a : (int?)null;
+
+    // Which INSTANCE of a power a row is about, for the powers that can have more than one.
+    //
+    // PowerCmd.FindExistingInstanceForStacking switches on PowerModel.InstanceType: `Instanced`
+    // never stacks and always adds a second instance (The Bomb, Sandpit, Monologue), and
+    // `InstancedPerApplier` keeps one per applier (Strangle, Oblivion). One creature therefore
+    // carries several live powers with the same id, and id + tgt_cid silently fuses them into one
+    // power whose amount jumps around. 883 rows of the recorded corpus are these powers.
+    //
+    // Written for those two only. For PowerInstanceType.None the game guarantees uniqueness
+    // itself -- Creature.ApplyPowerInternal throws on a second non-instanced instance of the same
+    // type -- so id + tgt_cid is already a key there and a pid would be 64k rows of restatement.
+    // An unreadable InstanceType writes nothing, losing the discriminator rather than inventing
+    // one, and keeps the game's own spelling of the value the way reward_kind keeps RelicReward.
+    private static void StampInstance(ReplayLine line, object? power)
+    {
+        if (power == null) return;
+        var instancing = Reflect.GetMember(power, "InstanceType")?.ToString();
+        if (instancing == null || instancing == "None") return;
+        line.Set("inst", instancing).Set("pid", PowerInstances.Of(power));
+    }
+
+    // The last thing asked of a power before the modifiers ran, keyed on the PowerModel the
+    // request was about. The applier is stored as the two already-resolved row fields rather than
+    // as the Creature, so a stashed intent never keeps a body alive for the sake of a field.
+    private sealed class Intent
+    {
+        public int Amount;
+        public string Src = "effect";
+        public int? SrcCid;
+        public string? Card;
+    }
+
+    private static readonly ConditionalWeakTable<object, Intent> Intents = new();
+
+    // The stashed intent for this power, but only when it belongs to the change being recorded.
+    //
+    // `src` is matched because nesting on one power instance is possible -- a listener of the
+    // before hook is free to modify the same power -- and a stale intent written onto a later row
+    // would be exactly the plausible wrong number this file keeps warning about. A mismatch, or a
+    // missing stash, reads as unknown.
+    private static int? IntendedAmount(object? power, string src)
+    {
+        if (power == null) return null;
+        return Intents.TryGetValue(power, out var intent) && intent.Src == src
+            ? intent.Amount : (int?)null;
+    }
+
+    // CombatManager.Instance.IsInProgress, as a tag on the teardown wipes.
+    //
+    // EndCombatInternal sets IsInProgress = false before it does anything else, and both
+    // Player.AfterCombatEnd and CombatManager.Reset wipe every remaining power well after that,
+    // so a false here reads "the fight was already over". A run abandoned mid-fight is the
+    // exception: that wipe runs from RunManager's cleanup with the fight still flagged in
+    // progress, so those rows go out untagged.
+    //
+    // Returns null and never false, so a renamed IsInProgress cannot read as "during the fight".
+    private static Type? _combatManagerType;
+
+    private static object? PostCombat()
+    {
+        var mgr = Reflect.GetStatic(_combatManagerType, "Instance");
+        if (mgr == null) return null;
+        return Reflect.GetMember(mgr, "IsInProgress") is false ? (object)true : null;
     }
 
     // CreatureCmd.Heal(creature, amount, playAnim). Patched directly because the game's
