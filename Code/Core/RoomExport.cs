@@ -94,7 +94,7 @@ internal static class RoomExport
     // The card an event option references, pulled from its CardHoverTip (the same preview the game
     // shows on hover, e.g. the card Slippery Bridge's "Overcome" option will make you lose). The
     // game pre-picks and displays it, so it's knowable before the choice. Null when no card is hovered.
-    private static string? OptionCard(object opt)
+    internal static string? OptionCard(object opt)
     {
         if (Reflect.GetMember(opt, "HoverTips") is not IEnumerable tips) return null;
         foreach (var t in tips)

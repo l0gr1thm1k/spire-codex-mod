@@ -54,11 +54,6 @@ internal static class ReplayHooks
     // before it joins to one.
     private const string EnchantSelectType = "deck_select_enchant";
 
-    // Signature of the event page a decision was opened for. Multi-page events (Neow offers a
-    // boon and then a separate Proceed) are two distinct choice sets, and keying only on
-    // "am I already in an event" would collapse them into one decision with two winners.
-    private static string? _eventPage;
-
     // Bumped by CardReward.Reroll and consumed by the Populate that follows it, so a rerolled
     // offer keeps its decision and increments offer_generation. The earlier version minted a
     // fresh decision with generation 0 every time, contradicting its own contract and losing
@@ -142,6 +137,12 @@ internal static class ReplayHooks
         _selected = null;
         _selectDecision = 0;
         _selectDecisionType = null;
+        // Event page state. A second run in the same process would otherwise start with the last
+        // run's event id latched and its page numbering continuing, and BeginEvent only clears
+        // them once the new run reaches its first event.
+        _eventDecision = 0;
+        _eventPageIndex = -1;
+        _eventId = null;
     }
 
     // MerchantEntry.OnTryPurchaseWrapper(inventory, ignoreCost) — fires on the ATTEMPT, so the
@@ -393,8 +394,66 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPotionDiscarded", me, nameof(PotionDiscarded));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRestSiteHeal", me, nameof(RestHeal));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRestSiteSmith", me, nameof(RestSmith));
-        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Events.EventOption"),
-                                 "Chosen", me, nameof(EventOptionChosen), 0);
+
+        // --- events ------------------------------------------------------------------
+        //
+        // Event pages come from the game's own funnels, not from the live snapshot. The snapshot
+        // is a 10 Hz sample and an event page is frequently set and answered between two ticks:
+        // 706 of the 1009 event decisions in the 953-journal corpus carried an EMPTY option list,
+        // 407 outcomes named an option their own decision never listed, and every Neow opening --
+        // the highest-leverage choice in a run -- was in the broken set.
+        //
+        // EventModel.SetEventState is the single page-transition funnel. SetInitialEventState,
+        // SetEventFinished and all 30-odd per-event page bodies route through it, and nothing in
+        // the assembly overrides it, so one patch sees every page of every event. POSTFIX: it is
+        // a plain `void`, not `async Task`, so a postfix runs with the page fully built rather
+        // than at a first await, and CurrentOptions is populated by then.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.EventModel"),
+            "SetEventState", me, nameof(EventPageShown), 2, postfix: true);
+        // A visit restarts page numbering. BeginEvent, not SetInitialEventState: AncientEventModel
+        // OVERRIDES the latter, so a base patch would miss every Ancient and Neow itself.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.EventModel"),
+            "BeginEvent", me, nameof(EventBegun), 2);
+        // The execution half. ChooseOptionForEvent is where an index becomes the option that
+        // runs, for the local click and for a peer's, so it is the one place that carries both
+        // the Player and the slot the option occupied. PREFIX: it calls EventOption.Chosen(),
+        // which runs synchronously to its first await, and option bodies routinely set the next
+        // page before anything else -- a postfix would file the outcome against the page that
+        // replaced the one clicked.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Multiplayer.Game.EventSynchronizer"),
+            "ChooseOptionForEvent", me, nameof(EventOptionChosen), 2, firstParamType: "Player");
+        // Proceed never reaches the synchronizer: NEventRoom.OptionButtonClicked short-circuits
+        // IsProceed straight into option.Chosen(). Prefix, same async reason as above.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Nodes.Rooms.NEventRoom"),
+            "OptionButtonClicked", me, nameof(EventProceedClicked), 2, firstParamType: "EventOption");
+
+        // Not Harmony patches, so outside the n/attempted tally, but resolved here to keep the
+        // event capture in one block. Held as handles rather than read through Reflect.GetBool
+        // because `false` is a real answer for both: a renamed IsProceed would turn every page
+        // dismissal into a silent no-op, and a renamed IsLocked would report every greyed-out
+        // option as a rejected alternative. Unresolved means the field is omitted.
+        var eventOption = HookPatcher.FindType("MegaCrit.Sts2.Core.Events.EventOption");
+        _optLockedProp = eventOption?.GetProperty("IsLocked",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        _optProceedProp = eventOption?.GetProperty("IsProceed",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (_optLockedProp == null || _optProceedProp == null)
+            MainFile.Logger.Info("replay-hooks: EventOption.IsLocked/IsProceed not found; "
+                                 + "event option selectability and proceed rows are omitted");
+        // DynamicVarSet.AddTo(LocString), the prepare half of reading an option's text. Resolved
+        // rather than called by name because OptionText must be able to refuse: formatting an
+        // unprepared LocString sends a Sentry exception from the GAME's project, so no handle
+        // means no label and no desc rather than a best effort.
+        _addVarsMethod = HookPatcher
+            .FindType("MegaCrit.Sts2.Core.Localization.DynamicVars.DynamicVarSet")
+            ?.GetMethod("AddTo", BindingFlags.Public | BindingFlags.Instance);
+        if (_addVarsMethod == null)
+            MainFile.Logger.Info("replay-hooks: DynamicVarSet.AddTo not found; "
+                                 + "event option label/desc are omitted");
 
         // --- combat lifecycle --------------------------------------------------------
         // An extra turn shares its ROUND with the turn it extends: CombatManager.SwitchSides
@@ -523,7 +582,6 @@ internal static class ReplayHooks
             // A new room ends the previous decision context; a stale decision_id leaking onto
             // the next room's resolutions would silently mis-attribute picks.
             DemoteDecision();
-            _eventPage = null;
             // An abandoned purchase never reaches AfterItemPurchased, so it would leave the
             // pending ware set for the rest of the run. RelicObtained reads that to tell a
             // relic off a shelf from one out of a decision, and a stale value would make it
@@ -2029,69 +2087,284 @@ internal static class ReplayHooks
         try { ReplayRecorder.Line("rest")?.Set("option", "smith").Emit(); } catch { }
     }
 
-    // EventOption.Chosen(). The game gives us the option that WAS taken and no hook for the
-    // page being shown, so the first real journal recorded event outcomes against decision_id
-    // 0 — an outcome with no choice set, which is precisely the "rejection is indistinguishable
-    // from missing data" failure the schema review warned about.
+    // --- events ----------------------------------------------------------------------
+
+    // The decision id of the event page currently on screen, or 0 when the open page offers no
+    // real choice at all (the finished page, whose only button is the UI's synthesized Proceed).
     //
-    // The offer is recovered from the live snapshot, which already parses the event page's
-    // full option list (Sts2Access builds EventInfo, including each option's Locked flag).
-    // It is at most one producer tick stale, and an event page cannot change in the 100ms
-    // before the player clicks it.
-    private static void EventOptionChosen(object __instance)
+    // Deliberately separate from _decision. The two move at different moments: a page's offer is
+    // known the instant the page is built, while _decision only becomes this page when an option
+    // on it is actually taken. Collapsing them would file a grant made by page 1's option under
+    // page 2, because an option body usually sets its next page before it grants anything.
+    private static int _eventDecision;
+
+    // Index of the page currently open, within the current event VISIT. -1 before the first page.
+    // Neow's boon page and its done page are two pages of one visit, not one decision with two
+    // winners, and Orobas is up to four.
+    private static int _eventPageIndex = -1;
+
+    // The event whose page is open, latched from EventModel.Id so the proceed row does not have
+    // to reach into NEventRoom's private _event field to name its own event.
+    private static string? _eventId;
+
+    // EventOption.IsLocked / IsProceed and DynamicVarSet.AddTo, resolved once at install. See the
+    // install block for why all three are handles rather than read or called by name.
+    private static PropertyInfo? _optLockedProp;
+    private static PropertyInfo? _optProceedProp;
+    private static MethodInfo? _addVarsMethod;
+
+    // EventModel.BeginEvent(Player player, bool isPreFinished) prefix. One visit, one page
+    // numbering.
+    //
+    // Owner is assigned inside BeginEvent, so the local check reads the Player argument instead.
+    // In co-op the synchronizer clones one EventModel per player and begins each of them, so
+    // without the check a two-player run would reset (and later double-record) every page.
+    private static void EventBegun(object __0)
     {
         try
         {
-            var chosenKey = Reflect.GetString(__instance, "TextKey");
-            var label = Reflect.CallString(Reflect.GetMember(__instance, "Title"), "GetFormattedText");
-            if (string.IsNullOrWhiteSpace(label)) label = chosenKey;
+            if (LocalPlayer.IsCoop && !LocalPlayer.IsLocalPlayer(__0)) return;
+            _eventPageIndex = -1;
+            _eventDecision = 0;
+            _eventId = null;
+        }
+        catch { }
+    }
 
-            // Open the decision for this page the first time an option on it is taken.
-            var page = Producer.LiveStateProducer.Latest?.Event is { } e0
-                ? $"{e0.Id}|{e0.Options.Count}|{(e0.Options.Count > 0 ? e0.Options[0].Key : "")}"
-                : null;
-            if (Producer.LiveStateProducer.Latest?.Event is { } ev && page != _eventPage)
+    // EventModel.SetEventState(LocString description, IEnumerable<EventOption> options) postfix.
+    // One row per page, carrying the option set that was on screen.
+    //
+    // The offer is read off CurrentOptions rather than off the `options` argument. Not paranoia:
+    // CurrentOptions is the list NEventRoom.SetOptions renders and the list
+    // EventSynchronizer.ChooseOptionForEvent indexes into, so recording it is what makes this
+    // row's option_index the same number the outcome reports. The argument is an arbitrary
+    // IEnumerable from thirty-odd call sites and has already been copied by the time we run.
+    //
+    // A page with no real option gets NO decision row. Two cases reach it. The common one is the
+    // finished page: SetEventFinished calls through here with an empty list, which is also what
+    // flips IsFinished, and NEventRoom then mints a Proceed button that exists only in the UI.
+    // The rare one is an Ancient blocked by Hook.ShouldAllowAncient, whose CurrentOptions is a
+    // single real option with IsProceed set. Neither is a choice, and minting decisions for them
+    // is what produced 706 zero-option decision rows in the corpus.
+    private static void EventPageShown(object __instance)
+    {
+        try
+        {
+            var owner = Reflect.GetMember(__instance, "Owner");
+            if (LocalPlayer.IsCoop && !LocalPlayer.IsLocalPlayer(owner)) return;
+
+            // Whatever was open belonged to the page being replaced.
+            _eventDecision = 0;
+            var pageIndex = ++_eventPageIndex;
+            _eventId = Ids.Bare(Reflect.GetString(__instance, "Id"));
+
+            var options = new List<ReplayLine>();
+            var index = 0;
+            var real = 0;
+            var selectable = 0;
+            var lockedKnown = true;
+            string? pageKey = null;
+            var pageKeyAgrees = true;
+
+            foreach (var opt in Enumerate(Reflect.GetMember(__instance, "CurrentOptions")))
             {
-                _eventPage = page;
-                _decision = ReplayRecorder.NextDecisionId();
-                _decisionType = "event";
-                var options = new List<ReplayLine>();
-                var i = 0;
-                foreach (var o in ev.Options)
+                var key = Reflect.GetString(opt, "TextKey");
+                var proceed = OptFlag(_optProceedProp, opt);
+                var locked = OptFlag(_optLockedProp, opt);
+                if (proceed is not true) real++;
+                if (locked == null) lockedKnown = false;
+                else if (locked == false) selectable++;
+
+                // Proceed options stay in the list so option_index keeps matching the game's own
+                // indexing, even though a page made only of them emits no decision at all.
+                var row = new ReplayLine("o")
+                    .Set("option_index", index++)
+                    .Set("option_kind", proceed is true ? "proceed" : "event_option")
+                    .Set("option_id", key)
+                    .Set("label", OptionText(__instance, opt, "Title"))
+                    .Set("desc", OptionText(__instance, opt, "Description"))
+                    .Set("grants_card", RoomExport.OptionCard(opt))
+                    .Set("grants_relic", Ids.Bare(Reflect.GetString(Reflect.GetMember(opt, "Relic"), "Id")))
+                    .SetFlag("presented", true);
+                if (locked != null)
                 {
-                    var row = new ReplayLine("o")
-                        .Set("option_index", i++)
-                        .Set("option_kind", "event_option")
-                        .Set("option_id", o.Key)
-                        .Set("label", o.Text)
-                        .Set("desc", o.Desc)
-                        .Set("grants_card", o.Card)
-                        .Set("grants_relic", o.Relic)
-                        .SetFlag("presented", true)
-                        .SetFlag("selectable", !o.Locked);
-                    if (o.Locked) row.Set("selectable_reason", "locked");
-                    options.Add(row);
+                    row.SetFlag("selectable", locked == false);
+                    if (locked == true) row.Set("selectable_reason", "locked");
                 }
-                ReplayRecorder.Line("decision")
-                    ?.Set("decision_id", _decision)
-                    .Set("decision_type", "event")
-                    .Set("source", "event")
-                    .Set("event_id", ev.Id)
-                    .Set("n_presented", options.Count)
-                    .Set("n_selectable", options.Count(o => o.Fields["selectable"] is true))
-                    .Set("options", options)
-                    .Emit();
+                options.Add(row);
+
+                if (PageKeyOf(key) is not { } p) continue;
+                if (pageKey == null) pageKey = p;
+                else if (pageKey != p) pageKeyAgrees = false;
+            }
+
+            if (real == 0) return;
+
+            // Mint only when something will read it, the same contract OpenSelectOffer keeps:
+            // advancing decision state for a run nobody is recording leaves the next real
+            // decision with a gap in its id.
+            if (ReplayRecorder.Line("decision") is not { } line) return;
+            _eventDecision = ReplayRecorder.NextDecisionId();
+            line.Set("decision_id", _eventDecision)
+                .Set("decision_type", "event")
+                .Set("source", "event")
+                .Set("event_id", _eventId)
+                .Set("page_index", pageIndex)
+                .Set("page_key", pageKeyAgrees ? pageKey : null)
+                .Set("n_presented", options.Count)
+                .Set("n_selectable", lockedKnown ? selectable : (int?)null)
+                .Set("options", options);
+            StampEventFloor(line, owner);
+            line.Emit();
+        }
+        catch { }
+    }
+
+    // EventSynchronizer.ChooseOptionForEvent(Player player, int optionIndex) prefix. The option
+    // that actually ran, and the slot it occupied on the page the decision row listed.
+    //
+    // option_index is the join that survives a duplicate option id, and duplicates are real:
+    // War Historian Repy reuses its INITIAL loc keys on a later page, and every one of Neow's
+    // per-modifier pages keys on the modifier's own id.
+    //
+    // Not patched at EventOption.Chosen(), which is where this used to sit. Chosen() holds no
+    // reference back to its EventModel and no index, so it could name neither the page nor the
+    // slot, and in co-op it fires once per player's clone with no way to tell them apart.
+    private static void EventOptionChosen(object __instance, object __0, int __1)
+    {
+        try
+        {
+            if (LocalPlayer.IsCoop && !LocalPlayer.IsLocalPlayer(__0)) return;
+
+            var model = Reflect.CallWith(__instance, "GetEventForPlayer", __0);
+            var opt = ElementAt(Reflect.GetMember(model, "CurrentOptions"), __1);
+            var chosenKey = Reflect.GetString(opt, "TextKey");
+            var label = OptionText(model, opt, "Title") ?? chosenKey;
+
+            // The clicked page becomes the open decision HERE, not when the page appeared, so a
+            // relic granted or removed by this option joins to the page that offered it.
+            // RelicObtained and RelicRemoved both gate on _decisionType == "event".
+            DemoteDecision();
+            if (_eventDecision > 0)
+            {
+                _decision = _eventDecision;
+                _decisionType = "event";
             }
 
             ReplayRecorder.Line("outcome")
-                ?.Set("decision_id", _decision > 0 ? _decision : (int?)null)
+                ?.Set("decision_id", _eventDecision > 0 ? _eventDecision : (int?)null)
                 .Set("decision_type", "event")
                 .Set("outcome", "chosen")
+                .Set("option_index", __1)
                 .Set("option_id", chosenKey)
                 .Set("label", label)
                 .Emit();
         }
         catch { }
+    }
+
+    // NEventRoom.OptionButtonClicked(EventOption option, int index) prefix. The Proceed button,
+    // and nothing else.
+    //
+    // Proceed gets a row of its own rather than a decision and an outcome. It is not a decision:
+    // NEventRoom.SetOptions synthesizes it whenever EventModel.IsFinished, it exists in no
+    // CurrentOptions on that path, and it has no alternatives, so there is nothing rejected and
+    // nothing revealed. Recording it as one is what put 707 phantom outcomes and 599 zero-option
+    // decisions in the corpus. It is not nothing either: "the player read the last page and went
+    // back to the map" is the only thing separating a finished event from a run that quit on it.
+    //
+    // Real choices are deliberately NOT recorded here. This is the LOCAL CLICK, which in a shared
+    // co-op event is a vote that can lose; ChooseOptionForEvent above is the option that ran.
+    private static void EventProceedClicked(object __0)
+    {
+        try
+        {
+            if (OptFlag(_optLockedProp, __0) is true) return;      // the game ignores the click
+            if (OptFlag(_optProceedProp, __0) is not true) return; // a real choice, recorded above
+            _eventDecision = 0;
+            ReplayRecorder.Line("event_proceed")
+                ?.Set("event_id", _eventId)
+                .Set("page_index", _eventPageIndex >= 0 ? _eventPageIndex : (int?)null)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // A bool off a resolved handle. Null means the member is gone, which is not the same answer
+    // as false and must not be written as one.
+    private static bool? OptFlag(PropertyInfo? prop, object? opt)
+    {
+        if (prop == null || opt == null) return null;
+        try { return prop.GetValue(opt) as bool?; }
+        catch { return null; }
+    }
+
+    // An option's localized title or description, resolved exactly the way the game's own button
+    // resolves it.
+    //
+    // The AddTo call is not decoration and it is not a mutation of game state: a LocString keeps
+    // its own variable bag purely so it can be formatted, NEventOptionButton._Ready calls this
+    // same pair on these same LocStrings a moment later, and EventModel.GameInfoOptions does it
+    // to throwaway LocStrings for the same reason.
+    //
+    // Skipping it is the trap. The FIRST page of an event is set inside BeginEvent, before
+    // NEventRoom exists and therefore before any button has added the event's DynamicVars, so
+    // formatting it unprepared hits a missing variable -- and LocManager.SmartFormat answers a
+    // missing variable by logging an error, CAPTURING A SENTRY EXCEPTION and returning the raw
+    // template. That would both record "{Cards}" as a description and file a report in MegaCrit's
+    // own Sentry project for every option of every event of every run.
+    //
+    // Which is why an unresolved AddTo means no text at all. A missing label is a missing field;
+    // formatting anyway would be a wrong value AND telemetry noise in someone else's project.
+    private static string? OptionText(object? model, object? opt, string member)
+    {
+        if (_addVarsMethod == null) return null;
+        // GetOptionTitle/GetOptionDescription use LocString.GetIfExists, so a key the table does
+        // not carry reads as a null LocString rather than an empty one.
+        var loc = Reflect.GetMember(opt, member);
+        if (loc == null) return null;
+        var vars = Reflect.GetMember(model, "DynamicVars");
+        if (vars == null) return null;
+        try { _addVarsMethod.Invoke(vars, new[] { loc }); }
+        catch { return null; }
+        var text = Reflect.CallString(loc, "GetFormattedText");
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    // "NEOW.pages.INITIAL.options.LARGE_CAPSULE" -> "INITIAL", so a multi-page event is readable
+    // without joining every row back together. Null for a key that does not follow the
+    // convention, which is a real case rather than a defensive one: Neow's modifier pages key on
+    // the modifier id and The Architect builds its own keys. A guessed page name is worse than
+    // none, and page_index is always there.
+    private static string? PageKeyOf(string? textKey)
+    {
+        if (textKey == null) return null;
+        const string pages = ".pages.";
+        const string opts = ".options.";
+        var start = textKey.IndexOf(pages, StringComparison.Ordinal);
+        if (start < 0) return null;
+        start += pages.Length;
+        var end = textKey.IndexOf(opts, start, StringComparison.Ordinal);
+        return end > start ? textKey.Substring(start, end - start) : null;
+    }
+
+    // Stamp an event row with the event's own floor and act.
+    //
+    // EventRoom.EnterInternal begins the event BEFORE it awaits Hook.AfterRoomEntered, so the
+    // recorder's floor latch still holds the PREVIOUS room's floor when an event's first page is
+    // built. RunManager.EnterMapPointInternal has already appended the new map point by then, so
+    // the owner's run state is the correct source and it is read straight off it.
+    //
+    // Both values or neither: a corrected floor paired with a stale act is worse than the pair
+    // Line() already wrote.
+    private static void StampEventFloor(ReplayLine line, object? owner)
+    {
+        var runState = Reflect.GetMember(owner, "RunState");
+        if (runState == null) return;
+        var floor = Reflect.GetInt(runState, "TotalFloor", -1);
+        var actIndex = Reflect.GetInt(runState, "CurrentActIndex", -1);
+        if (floor < 0 || actIndex < 0) return;
+        line.Set("floor", floor).Set("act", actIndex + 1);
     }
 
     // --- helpers ---------------------------------------------------------------------
