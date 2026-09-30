@@ -302,6 +302,10 @@ internal static class ReplayHooks
 
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
                                  "Upgrade", me, nameof(CardUpgraded), 2, firstParamType: "CardModel");
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "Downgrade", me, nameof(DowngradeStarting), 1);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "Downgrade", me, nameof(CardDowngraded), 1, postfix: true);
 
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Models.CardModel"),
                                  "AfterTransformedFrom", me, nameof(TransformedFrom), 0);
@@ -2419,6 +2423,33 @@ internal static class ReplayHooks
                 .Set("option_index", offered ? SelectIndexOf(__0) : null)
                 .Set("c", CardInstances.Of(__0))
                 .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    private static int _levelBeforeDowngrade;
+
+    private static void DowngradeStarting(object __0)
+    {
+        try { _levelBeforeDowngrade = Reflect.GetInt(__0, "CurrentUpgradeLevel", 0); } catch { }
+    }
+
+    private static void CardDowngraded(object __0)
+    {
+        try
+        {
+            var before = _levelBeforeDowngrade;
+            _levelBeforeDowngrade = 0;
+            var after = Reflect.GetInt(__0, "CurrentUpgradeLevel", 0);
+            if (after >= before) return;
+            ReplayRecorder.MarkDeckChanged();
+            ReplayRecorder.Line("downgrade")
+                ?.Set("decision_id", _decisionType == "event" && _decision > 0 ? _decision : (int?)null)
+                .Set("c", CardInstances.Of(__0))
+                .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Set("from_up", before)
+                .Set("up", after)
                 .Emit();
         }
         catch { }
