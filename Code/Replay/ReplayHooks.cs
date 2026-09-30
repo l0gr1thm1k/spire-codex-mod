@@ -279,6 +279,11 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDamageGiven", me, nameof(DamageGiven));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDamageReceived", me, nameof(DamageReceived));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPowerAmountChanged", me, nameof(PowerChanged));
+        // Doom kills through CreatureCmd.Kill, not DamageCmd, so no hit row ever sees it.
+        // DoomKill is the one entry point both turn-end triggers and End of Days use.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.Powers.DoomPower"),
+            "DoomKill", me, nameof(DoomKilled), 1);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterBlockGained", me, nameof(BlockGained));
         // No first-party hook exists for either of these, so they patch game internals by name
         // and degrade to "that line stops appearing" if a patch renames them.
@@ -1008,6 +1013,35 @@ internal static class ReplayHooks
                 // only one of the two slugs actually had.
                 .Set("tgt_cid", CreatureSlots.Maybe(owner))
                 .Emit();
+        }
+        catch { }
+    }
+
+    // DoomPower.DoomKill(IReadOnlyList<Creature> creatures), prefix. One row per creature, ahead
+    // of the kill and of anything its death sets off.
+    //
+    // A Doom kill had no row at all: no hit, because CreatureCmd.Kill is not a damage command,
+    // and no death, because nothing records deaths except as `killed` on a hit. On 6FTX7ZD7UEUH
+    // f24 Doom 21 took Decimillipede's FRONT segment at 19 HP at the end of enemy turn 2, and the
+    // only evidence was FRONT choosing REATTACH_MOVE on turn 3.
+    //
+    // The row states the attempt. Whether the creature stays dead is the kill's business -- a
+    // revive like Reattach can answer it -- and shows in the rows that follow.
+    private static void DoomKilled(object __0)
+    {
+        try
+        {
+            foreach (var creature in Enumerate(__0))
+            {
+                var doom = Enumerate(Reflect.GetMember(creature, "Powers"))
+                    .FirstOrDefault(p => p.GetType().Name == "DoomPower");
+                ReplayRecorder.Line("doom_kill")
+                    ?.Set("dst", CreatureRef(creature))
+                    .Set("dst_cid", CreatureSlots.Maybe(creature))
+                    .Set("hp", Reflect.GetInt(creature, "CurrentHp", 0))
+                    .Set("doom", doom == null ? (int?)null : Reflect.GetInt(doom, "Amount", 0))
+                    .Emit();
+            }
         }
         catch { }
     }
