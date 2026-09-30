@@ -627,6 +627,17 @@ internal static class ReplayHooks
             HookPatcher.FindType("MegaCrit.Sts2.Core.Models.Powers.DoomPower"),
             "DoomKill", me, nameof(DoomKillStarting), 1);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDiedToDoom", me, nameof(DoomKillDone));
+        // --- intents ---
+        // What each enemy telegraphed, with numbers, at the moments the player saw it. Rolls
+        // happen in StartTurn before the hand draw, so the telegraph is written once the turn
+        // is actually handed over (AfterPlayerTurnStart) and again at BeforeTurnEnd only where
+        // the shown numbers moved. See the intents section for the rest.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeSideTurnStart", me, nameof(IntentTurnStarting));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPlayerTurnStart", me, nameof(IntentsShown));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeTurnEnd", me, nameof(IntentsCommitted));
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.MonsterModel"),
+            "SetMoveImmediate", me, nameof(MoveSetImmediate), 2);
 
         // Not Harmony patches, so deliberately outside the n/attempted tally: these are plain
         // member lookups whose absence costs two fields on one row, not a whole line kind.
@@ -829,6 +840,10 @@ internal static class ReplayHooks
             if (__result == null || __1 == null) return;
             MoveOwners.Remove(__result);
             MoveOwners.Add(__result, __1);
+            // A roll after the turn-start telegraph (a mid-turn spawn) is the only time the
+            // player sees this intent before it can change, so it gets its own row.
+            if (IntentsShownFor(Reflect.GetMember(__1, "CombatState")))
+                EmitIntent(__1, __result, "roll");
         }
         catch { }
     }
@@ -840,9 +855,7 @@ internal static class ReplayHooks
         try
         {
             if (!MoveOwners.TryGetValue(__instance, out var owner)) return;
-            var intents = Enumerate(Reflect.GetMember(__instance, "Intents"))
-                .Select(i => Reflect.GetMember(i, "IntentType")?.ToString()?.ToLowerInvariant())
-                .Where(x => x != null).ToList();
+            var intents = IntentTypes(__instance);
             ReplayRecorder.Line("move")
                 ?.Set("src", CreatureRef(owner))
                 // Which enemy is about to act. In a fight with two of the same monster the two
@@ -3407,6 +3420,171 @@ internal static class ReplayHooks
             foreach (var c in Enumerate(__1)) _doomed.Remove(c);
         }
         catch { }
+    }
+
+    // --- intents ---------------------------------------------------------------------
+    //
+    // `intent` rows: what an enemy telegraphed and when. `at` says which moment:
+    //   turn_start  every enemy, once the player's hand is dealt and they can act
+    //   roll        a move rolled after that (mid-turn spawn)
+    //   set         SetMoveImmediate replaced the shown move (stun, enrage, revive, phase)
+    //   turn_end    BeforeTurnEnd, only for enemies whose shown move or numbers changed
+    // `move` rows still mark when the move is performed.
+
+    // The combat whose turn-start telegraph has been written, cleared at every side's turn
+    // start. Rolls before it are the StartTurn batch the turn_start rows already cover.
+    // Keyed to the combat so a new fight's setup rolls never read the last fight's latch.
+    private static WeakReference<object>? _intentsShownFor;
+
+    // The last (id, dmg, hits) written per creature, so turn_end only writes what moved.
+    private static readonly ConditionalWeakTable<object, string> LastIntent = new();
+
+    // AttackIntent.GetSingleDamage(targets, owner), per concrete intent type. Null when the
+    // type has none, which is every non-attack intent.
+    private static readonly Dictionary<Type, MethodInfo?> SingleDamageMethods = new();
+
+    private static bool IntentsShownFor(object? combat)
+        => combat != null && _intentsShownFor != null
+           && _intentsShownFor.TryGetTarget(out var shown) && ReferenceEquals(shown, combat);
+
+    // Hook.BeforeSideTurnStart(ICombatState combatState, CombatSide side, participants).
+    // Runs before CombatManager.StartTurn's PrepareForNextTurn rolls.
+    private static void IntentTurnStarting()
+    {
+        _intentsShownFor = null;
+    }
+
+    // Hook.AfterPlayerTurnStart(ICombatState combatState, PlayerChoiceContext, Player player).
+    // Fires once per player in co-op; the latch keeps it to one telegraph per turn.
+    private static void IntentsShown(object __0)
+    {
+        try
+        {
+            if (__0 == null || IntentsShownFor(__0)) return;
+            _intentsShownFor = new WeakReference<object>(__0);
+            foreach (var enemy in Enumerate(Reflect.GetMember(__0, "Enemies")))
+            {
+                var move = Reflect.GetMember(Reflect.GetMember(enemy, "Monster"), "NextMove");
+                if (move != null) EmitIntent(enemy, move, "turn_start");
+            }
+        }
+        catch { }
+    }
+
+    // Hook.BeforeTurnEnd(ICombatState combatState, CombatSide side, participants). The
+    // player's side only: what they ended the turn against, where it differs from the last
+    // row for that enemy (Weak applied, Strength gained, a move swapped).
+    private static void IntentsCommitted(object __0, object __1)
+    {
+        try
+        {
+            if (__1?.ToString() != "Player") return;
+            foreach (var enemy in Enumerate(Reflect.GetMember(__0, "Enemies")))
+            {
+                var move = Reflect.GetMember(Reflect.GetMember(enemy, "Monster"), "NextMove");
+                if (move == null) continue;
+                var (dmg, hits) = AttackNumbers(move, enemy);
+                var sig = IntentSig(Reflect.GetString(move, "StateId"), dmg, hits);
+                if (LastIntent.TryGetValue(enemy, out var last) && last == sig) continue;
+                EmitIntent(enemy, move, "turn_end");
+            }
+        }
+        catch { }
+    }
+
+    // MonsterModel.SetMoveImmediate(MoveState state, bool forceTransition). Prefix, so the
+    // outgoing NextMove is still readable. Mirrors the method's own guard: when the current
+    // move can't transition and the swap isn't forced, nothing changes and nothing is written.
+    // Also latches the owner: these states never pass through RollMove, so without it a
+    // stun from a card (Whistle) or a revive performed with no `move` row at all.
+    private static void MoveSetImmediate(object __instance, object __0, object __1)
+    {
+        try
+        {
+            if (__0 == null || __1 is not bool force) return;
+            var owner = Reflect.GetMember(__instance, "Creature");
+            if (owner == null) return;
+            // The bestiary calls this on display monsters outside any fight.
+            if (Reflect.Call(Reflect.GetMember(owner, "CombatState"), "IsLiveCombat") is not true) return;
+            var from = Reflect.GetMember(__instance, "NextMove");
+            if (!force && Reflect.GetMember(from, "CanTransitionAway") is not true) return;
+            if (ReferenceEquals(from, __0)) return;
+            MoveOwners.Remove(__0);
+            MoveOwners.Add(__0, owner);
+            EmitIntent(owner, __0, "set", Reflect.GetString(from, "StateId"));
+        }
+        catch { }
+    }
+
+    private static void EmitIntent(object owner, object move, string at, string? from = null)
+    {
+        var id = Reflect.GetString(move, "StateId");
+        var (dmg, hits) = AttackNumbers(move, owner);
+        LastIntent.AddOrUpdate(owner, IntentSig(id, dmg, hits));
+        var intents = IntentTypes(move);
+        ReplayRecorder.Line("intent")
+            ?.Set("src", CreatureRef(owner))
+            .Set("src_cid", CreatureSlots.Maybe(owner))
+            .Set("id", id)
+            .Set("at", at)
+            .Set("from", from)
+            .Set("intents", intents.Count > 0 ? intents : null)
+            .Set("dmg", dmg)
+            .Set("hits", hits)
+            .Emit();
+    }
+
+    private static string IntentSig(string? id, int? dmg, int? hits) => $"{id}|{dmg}|{hits}";
+
+    // Lowercased IntentType names, the shape move.intents has always had.
+    private static List<string> IntentTypes(object move)
+        => Enumerate(Reflect.GetMember(move, "Intents"))
+            .Select(i => Reflect.GetMember(i, "IntentType")?.ToString()?.ToLowerInvariant())
+            .Where(x => x != null).Select(x => x!).ToList();
+
+    // The per-hit damage the player's intent label shows, and the hit count. Omitted unless
+    // the move has exactly one attack intent (every move in v0.107.1 has at most one).
+    //
+    // GetSingleDamage runs DamageCalc() and Hook.ModifyDamage against the local player. Both
+    // are pure reads in v0.107.1 (no RNG, no writes; modifiers are returned, not applied), and
+    // the game calls it on every intent refresh. It ignores `targets`, so null is passed.
+    private static (int? dmg, int? hits) AttackNumbers(object move, object owner)
+    {
+        object? attack = null;
+        MethodInfo? method = null;
+        var count = 0;
+        foreach (var intent in Enumerate(Reflect.GetMember(move, "Intents")))
+        {
+            var m = SingleDamageMethod(intent.GetType());
+            if (m == null) continue;
+            attack = intent;
+            method = m;
+            count++;
+        }
+        if (count != 1 || attack == null || method == null) return (null, null);
+        int? dmg = null;
+        try
+        {
+            if (method.Invoke(attack, new object?[] { null, owner }) is int d) dmg = d;
+        }
+        catch { }
+        var hits = Reflect.GetMember(attack, "Repeats") is int r ? r : (int?)null;
+        return (dmg, hits);
+    }
+
+    private static MethodInfo? SingleDamageMethod(Type type)
+    {
+        if (SingleDamageMethods.TryGetValue(type, out var cached)) return cached;
+        MethodInfo? found = null;
+        try
+        {
+            found = type.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "GetSingleDamage" && m.ReturnType == typeof(int)
+                                     && m.GetParameters().Length == 2);
+        }
+        catch { }
+        SingleDamageMethods[type] = found;
+        return found;
     }
 
     // --- helpers ---------------------------------------------------------------------
