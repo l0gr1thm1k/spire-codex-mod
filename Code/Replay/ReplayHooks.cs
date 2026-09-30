@@ -340,9 +340,11 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.PatchOn(harmony,
             HookPatcher.FindType("MegaCrit.Sts2.Core.Models.EventModel"),
             "SetEventState", me, nameof(EventPageShown), 2, postfix: true);
-        attempted++; n += HookPatcher.PatchOn(harmony,
-            HookPatcher.FindType("MegaCrit.Sts2.Core.Models.EventModel"),
-            "BeginEvent", me, nameof(EventBegun), 2);
+        var eventModel = HookPatcher.FindType("MegaCrit.Sts2.Core.Models.EventModel");
+        var beginEventArgs = eventModel?.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Any(m => m.Name == "BeginEvent" && m.GetParameters().Length == 3) == true ? 3 : 2;
+        attempted++; n += HookPatcher.PatchOn(harmony, eventModel,
+            "BeginEvent", me, nameof(EventBegun), beginEventArgs);
         attempted++; n += HookPatcher.PatchOn(harmony,
             HookPatcher.FindType("MegaCrit.Sts2.Core.Multiplayer.Game.EventSynchronizer"),
             "ChooseOptionForEvent", me, nameof(EventOptionChosen), 2, firstParamType: "Player");
@@ -405,7 +407,7 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDiedToDoom", me, nameof(DoomKillDone));
         attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeSideTurnStart", me, nameof(IntentTurnStarting));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterPlayerTurnStart", me, nameof(IntentsShown));
-        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeTurnEnd", me, nameof(IntentsCommitted));
+        attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeTurnEnd|BeforeSideTurnEnd", me, nameof(IntentsCommitted));
         attempted++; n += HookPatcher.PatchOn(harmony,
             HookPatcher.FindType("MegaCrit.Sts2.Core.Models.MonsterModel"),
             "SetMoveImmediate", me, nameof(MoveSetImmediate), 2);
