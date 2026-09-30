@@ -389,9 +389,51 @@ internal static class ReplayHooks
             MainFile.Logger.Info("replay-hooks: CombatManager not found; a monster heal during "
                                  + "combat end may emit a spare hp row, and power_lost rows lose post_combat");
 
+        // --- resources ---------------------------------------------------------------
+        // Gold, energy, stars, forge and orbs. Every row carries the resulting level, so a
+        // consumer never has to trust its own running sum. Card-paid energy and stars are left
+        // to the play row (cost_paid / stars_paid) and shop spends to the buy row.
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterGoldGained", me, nameof(GoldGained));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterOrbChanneled", me, nameof(OrbChanneled));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterOrbEvoked", me, nameof(OrbEvoked));
+        // PlayerCmd.LoseGold is every gold loss (25 call sites, SetGold included). It is a plain
+        // Task-returning method, not async, so the postfix runs after the gold has moved.
+        var playerCmd = HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.PlayerCmd");
+        attempted++; n += HookPatcher.PatchOn(harmony, playerCmd, "LoseGold", me, nameof(GoldLosing), 3);
+        attempted++; n += HookPatcher.PatchOn(harmony, playerCmd, "LoseGold", me, nameof(GoldLost), 3, postfix: true);
+        _merchantEntryType = HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Merchant.MerchantEntry");
+        // The Energy setter is the one place energy moves. SpendEnergy brackets a played card's
+        // payment (prefix sets, postfix at its first await clears) so it is not restated here.
+        var pcs = HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Players.PlayerCombatState");
+        var cardModel = HookPatcher.FindType("MegaCrit.Sts2.Core.Models.CardModel");
+        _cardModelType = cardModel;
+        attempted++; n += HookPatcher.PatchOn(harmony, pcs, "set_Energy", me, nameof(EnergySet), 1);
+        attempted++; n += HookPatcher.PatchOn(harmony, pcs, "ResetEnergy", me, nameof(EnergyResetting), 0);
+        attempted++; n += HookPatcher.PatchOn(harmony, pcs, "AddMaxEnergyToCurrent", me, nameof(EnergyCarrying), 0);
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterEnergyReset", me, nameof(EnergyReset));
+        attempted++; n += HookPatcher.PatchOn(harmony, cardModel, "SpendResources", me, nameof(CardSpending), 0);
+        attempted++; n += HookPatcher.PatchOn(harmony, cardModel, "SpendEnergy", me, nameof(CardEnergyPaying), 1);
+        attempted++; n += HookPatcher.PatchOn(harmony, cardModel, "SpendEnergy", me, nameof(CardEnergyPaid), 1, postfix: true);
+        // CombatHistory.StarsModified is called from the Stars setter with the signed delta, so
+        // it sees gains, spends and SetStars alike. Same bracket for the card payment.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.History.CombatHistory"),
+            "StarsModified", me, nameof(StarsModified), 3);
+        attempted++; n += HookPatcher.PatchOn(harmony, cardModel, "SpendStars", me, nameof(CardStarsPaying), 1);
+        attempted++; n += HookPatcher.PatchOn(harmony, cardModel, "SpendStars", me, nameof(CardStarsPaid), 1, postfix: true);
+        // Only fires for a forge that happened (ForgeCmd.Forge returns early when combat ends).
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterForge", me, nameof(Forged));
+        // Latches the evoke value and dequeue flag before the evoke runs, for OrbEvoked.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.OrbCmd"), "Evoke", me, nameof(OrbEvoking), 4);
+        // Each orb's own Passive override, which is every passive activation: the turn-start and
+        // turn-end triggers call it, and so do Loop, Tesla Coil, Darkness and Emotion Chip.
+        // Patched per override because the base method is an empty virtual.
+        var orbModel = HookPatcher.FindType("MegaCrit.Sts2.Core.Models.OrbModel");
+        foreach (var orbType in OrbTypesWithPassive(orbModel))
+        {
+            attempted++; n += HookPatcher.PatchOn(harmony, orbType, "Passive", me, nameof(OrbPassive), 2);
+        }
 
         // --- powers ------------------------------------------------------------------
         // A power LEAVING the board, which no first-party hook reports at all.
@@ -2720,27 +2762,324 @@ internal static class ReplayHooks
         catch { }
     }
 
+    // --- resources -------------------------------------------------------------------
+    //
+    // One series per resource, each row carrying the level after the change so the series
+    // corrects itself. Energy and stars start at 0 every combat (Player.ResetCombatState builds
+    // a fresh PlayerCombatState), and the play row's cost_paid / stars_paid covers the card
+    // payments these rows skip.
+
+    // Hook.AfterGoldGained(IRunState, Player). Fires right after Player.Gold += amount.
     private static void GoldGained(object __1)
     {
         try
         {
             ReplayRecorder.Line("gold")
                 ?.Set("gold", Reflect.GetInt(__1, "Gold", 0))
+                .Set("mine", Mine(__1))
                 .Emit();
         }
         catch { }
     }
 
-    private static void OrbChanneled(object __3) => Orb("orb_channel", __3);
-    private static void OrbEvoked(object __2) => Orb("orb_evoke", __2);
+    // PlayerCmd.LoseGold(decimal amount, Player player, GoldLossType goldLossType). The gold
+    // before, and whether a merchant entry is paying, latched for the postfix. Synchronous, so
+    // nothing runs between the two halves.
+    private static int? _goldBefore;
+    private static bool _goldShop;
+    private static Type? _merchantEntryType;
+    private static Type? _cardModelType;
 
-    private static void Orb(string kind, object orb)
+    private static void GoldLosing(object __1)
+    {
+        _goldBefore = null;
+        _goldShop = false;
+        try
+        {
+            _goldBefore = IntOf(__1, "Gold");
+            _goldShop = PaidByMerchant();
+        }
+        catch { }
+    }
+
+    // A negative `d` on the same gold row the gains use, with the game's own loss type as src.
+    // Only rows where gold actually moved: Seal of Gold or Thievery at 0 gold, and the 0-cost
+    // removal Lord's Parasol pays, change nothing.
+    private static void GoldLost(object __1, object __2)
     {
         try
         {
-            ReplayRecorder.Line(kind)?.Set("id", Ids.Bare(Reflect.GetString(orb, "Id"))).Emit();
+            if (_goldBefore is not int before) return;
+            _goldBefore = null;
+            if (_goldShop) return; // the buy row already carries cost and gold_on_hand
+            if (IntOf(__1, "Gold") is not int after || after == before) return;
+            ReplayRecorder.Line("gold")
+                ?.Set("gold", after)
+                .Set("d", after - before)
+                .Set("src", __2?.ToString()?.ToLowerInvariant())
+                .Set("mine", Mine(__1))
+                .Emit();
         }
         catch { }
+    }
+
+    // Whether LoseGold's direct caller is a shop purchase: a MerchantEntry subclass or the
+    // merchant's card removal. The GoldLossType cannot tell these apart, since events pay with
+    // Spent too, and the fake merchant event sells through MerchantEntry outside a MerchantRoom.
+    private static bool PaidByMerchant()
+    {
+        var owner = CallerOf("MegaCrit.Sts2.Core.Commands.PlayerCmd", out var body);
+        if (owner == null) return false;
+        if (_merchantEntryType != null && _merchantEntryType.IsAssignableFrom(owner)) return true;
+        return owner.Name == "OneOffSynchronizer" && body.StartsWith("<DoMerchantCardRemoval>");
+    }
+
+    // The type whose code called into `self`, skipping this class, `self` and the async
+    // plumbing. An async body runs in a compiler-generated state machine nested in the real
+    // type, so the outer type is returned and the state machine's name ("<Method>d__N") goes
+    // out as `body`. Only used on rare calls (gold loss) or once per card play.
+    private static Type? CallerOf(string self, out string body)
+    {
+        body = "";
+        foreach (var frame in new System.Diagnostics.StackTrace(1, false).GetFrames())
+        {
+            MethodBase? m;
+            try { m = Harmony.GetMethodFromStackframe(frame); }
+            catch { m = frame.GetMethod(); }
+            var t = m?.DeclaringType;
+            if (t == null) continue;
+            var owner = t.Name.StartsWith("<") && t.DeclaringType != null ? t.DeclaringType : t;
+            if (owner == typeof(ReplayHooks) || owner.FullName == self
+                || (owner.Namespace?.StartsWith("System") ?? false)) continue;
+            body = t.Name;
+            return owner;
+        }
+        return null;
+    }
+
+    // Turn-start energy. ResetEnergy / AddMaxEnergyToCurrent mark the next setter call as the
+    // turn's own, and AfterEnergyReset (which SetupPlayerTurn awaits straight after them) writes
+    // one row for it. The setter consumes the mark, so a renamed hook cannot leave it stuck.
+    private static string? _energyTurnMark;
+    private static bool? _energyTurnCarry;
+    private static int? _energyTurnFrom;
+    private static bool _cardPayingEnergy;
+    private static bool _cardPayingStars;
+
+    private static void EnergyResetting() { _energyTurnMark = "reset"; }
+    private static void EnergyCarrying() { _energyTurnMark = "carry"; }
+
+    // Cards whose SpendResources was called by PlayCardAction, the one caller whose payment
+    // reaches the play row. Whispering Earring also calls it, then autoplays with a ResourceInfo
+    // of 0 spent, so its payments are left to the energy and stars rows. Latched here because
+    // SpendStars can resume after an await, with PlayCardAction no longer on the stack.
+    private static readonly ConditionalWeakTable<object, object> PaidByPlay = new();
+
+    private static void CardSpending(object __instance)
+    {
+        try
+        {
+            PaidByPlay.Remove(__instance);
+            if (CallerOf("MegaCrit.Sts2.Core.Models.CardModel", out _)?.Name == "PlayCardAction")
+                PaidByPlay.Add(__instance, true);
+        }
+        catch { }
+    }
+
+    private static void CardEnergyPaying(object __instance, int __0)
+        => _cardPayingEnergy = __0 > 0 && PaidByPlay.TryGetValue(__instance, out _);
+    private static void CardEnergyPaid() => _cardPayingEnergy = false;
+    private static void CardStarsPaying(object __instance, int __0)
+    {
+        _cardPayingStars = __0 > 0 && PaidByPlay.TryGetValue(__instance, out _);
+        PaidByPlay.Remove(__instance); // SpendStars is the last half of SpendResources
+    }
+    private static void CardStarsPaid() => _cardPayingStars = false;
+
+    // PlayerCombatState.Energy's setter. Prefix, so the old level is still readable; the prefix
+    // runs even when the value does not change, which is what lets it consume the turn mark.
+    private static void EnergySet(object __instance, int __0)
+    {
+        try
+        {
+            if (_energyTurnMark is { } mark)
+            {
+                _energyTurnMark = null;
+                _energyTurnCarry = mark == "carry";
+                _energyTurnFrom = IntOf(__instance, "Energy");
+                return;
+            }
+            if (_cardPayingEnergy) return;
+            if (IntOf(__instance, "Energy") is not int old || old == __0) return;
+            ReplayRecorder.Line("energy")
+                ?.Set("d", __0 - old)
+                .Set("energy", __0)
+                .Set("mine", Mine(Reflect.GetMember(__instance, "_player")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Hook.AfterEnergyReset(ICombatState, Player). One row per player turn with the level the
+    // turn starts on and the max it was reset to. Written before the turn row, which the game
+    // fires only after the hand is drawn, so it carries the turn number itself.
+    private static void EnergyReset(object __1)
+    {
+        try
+        {
+            var carry = _energyTurnCarry;
+            var from = _energyTurnFrom;
+            _energyTurnCarry = null;
+            _energyTurnFrom = null;
+            var state = Reflect.GetMember(__1, "PlayerCombatState");
+            if (IntOf(state, "Energy") is not int energy) return;
+            ReplayRecorder.Line("energy")
+                ?.Set("src", "turn")
+                .Set("n", TurnNumberOf(__1))
+                .Set("d", from is int f ? energy - f : (int?)null)
+                .Set("energy", energy)
+                .Set("max", IntOf(state, "MaxEnergy"))
+                // True when ShouldPlayerResetEnergy said no and max was added to the leftover.
+                .Set("carry", carry)
+                .Set("mine", Mine(__1))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CombatHistory.StarsModified(ICombatState, int amount, Player). The Stars setter calls it
+    // after assigning, only when the value changed, with the signed delta.
+    private static void StarsModified(int __1, object __2)
+    {
+        try
+        {
+            if (_cardPayingStars) return;
+            if (IntOf(Reflect.GetMember(__2, "PlayerCombatState"), "Stars") is not int stars) return;
+            ReplayRecorder.Line("stars")
+                ?.Set("d", __1)
+                .Set("stars", stars)
+                .Set("mine", Mine(__2))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // Hook.AfterForge(ICombatState, decimal amount, Player forger, AbstractModel? source). The
+    // blade damage is already raised by now. Every non-dupe Sovereign Blade gets the amount,
+    // exhausted ones included, so each is listed with its resulting damage. A blade the forge
+    // created also has its own generate row just before this one.
+    private static void Forged(decimal __1, object __2, object? __3)
+    {
+        try
+        {
+            if (ReplayRecorder.Line("forge") is not { } line) return;
+            line.Set("amount", (int)__1)
+                .Set("src", Ids.Bare(Reflect.GetString(__3, "Id")))
+                // The card instance when a card forged, so two copies of one card stay apart.
+                .Set("src_c", _cardModelType?.IsInstanceOfType(__3) == true
+                    ? CardInstances.Of(__3) : (int?)null);
+            var blades = new List<ReplayLine>();
+            if (Reflect.GetMember(Reflect.GetMember(__2, "PlayerCombatState"), "AllCards") is IEnumerable all)
+            {
+                foreach (var card in all)
+                {
+                    if (card?.GetType().Name != "SovereignBlade" || Reflect.GetMember(card, "IsDupe") is true)
+                        continue;
+                    var dmg = Reflect.GetMember(Reflect.GetMember(Reflect.GetMember(card, "DynamicVars"),
+                        "Damage"), "BaseValue") is decimal d ? (int)d : (int?)null;
+                    blades.Add(new ReplayLine("blade").Set("c", CardInstances.Of(card)).Set("dmg", dmg));
+                }
+                line.Set("blades", blades);
+            }
+            line.Set("mine", Mine(__2)).Emit();
+        }
+        catch { }
+    }
+
+    // Orb instance ids, minted the way PowerInstances mints pids and for the same reason: two
+    // Frost orbs share an id, and a Dark or Glass orb's values depend on its own history.
+    private static readonly ConditionalWeakTable<object, string> OrbIds = new();
+    private static int _nextOrb;
+    private static string OrbId(object orb)
+        => OrbIds.GetValue(orb, _ => $"{ReplayRecorder.AttemptId}.{System.Threading.Interlocked.Increment(ref _nextOrb)}");
+
+    private sealed class EvokeLatch
+    {
+        public int? Val;
+        public bool Dequeue;
+    }
+    private static readonly ConditionalWeakTable<object, EvokeLatch> Evoking = new();
+
+    private static void OrbChanneled(object __3) => Orb("orb_channel", __3)?.Emit();
+
+    // Hook.AfterOrbEvoked fires after the evoke's own hit/block/energy rows, so this row closes
+    // them. val is read before the evoke ran (OrbEvoking), since that is the value it used.
+    private static void OrbEvoked(object __2)
+    {
+        try
+        {
+            var line = Orb("orb_evoke", __2);
+            if (line != null && Evoking.TryGetValue(__2, out var latch))
+            {
+                Evoking.Remove(__2);
+                line.Set("val", latch.Val)
+                    // dequeue false leaves the orb in its slot to be evoked or trigger again.
+                    .Set("kept", !latch.Dequeue);
+            }
+            line.Emit();
+        }
+        catch { }
+    }
+
+    // OrbCmd.Evoke(PlayerChoiceContext, Player, OrbModel evokedOrb, bool dequeue).
+    private static void OrbEvoking(object __2, bool __3)
+    {
+        try
+        {
+            Evoking.AddOrUpdate(__2, new EvokeLatch { Val = OrbValue(__2, "EvokeVal"), Dequeue = __3 });
+        }
+        catch { }
+    }
+
+    // An orb's Passive override. Prefix, so the row lands BEFORE the hit, block or energy rows
+    // it causes (a lightning or glass hit reads src "player" and is otherwise unattributable).
+    // val is what this activation applies: damage, block, energy, or a Dark orb's evoke growth.
+    // Glass at 0 still runs and records val 0.
+    private static void OrbPassive(object __instance)
+    {
+        try
+        {
+            Orb("orb_passive", __instance)?.Set("val", OrbValue(__instance, "PassiveVal")).Emit();
+        }
+        catch { }
+    }
+
+    private static ReplayLine? Orb(string kind, object orb)
+    {
+        try
+        {
+            return ReplayRecorder.Line(kind)
+                ?.Set("id", Ids.Bare(Reflect.GetString(orb, "Id")))
+                .Set("oid", orb == null ? null : OrbId(orb))
+                .Set("mine", Mine(Reflect.GetMember(orb, "Owner")));
+        }
+        catch { return null; }
+    }
+
+    // PassiveVal / EvokeVal are decimal and focus-modified; every source is whole-numbered.
+    private static int? OrbValue(object orb, string name)
+        => Reflect.GetMember(orb, name) is decimal d ? (int)d : (int?)null;
+
+    // Concrete orb types that declare their own Passive, so the empty base is never patched.
+    private static IEnumerable<Type> OrbTypesWithPassive(Type? orbModel)
+    {
+        if (orbModel == null) return Array.Empty<Type>();
+        Type[] types;
+        try { types = orbModel.Assembly.GetTypes(); }
+        catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray()!; }
+        return types.Where(t => !t.IsAbstract && orbModel.IsAssignableFrom(t)
+                                && t.GetMethod("Passive", BindingFlags.Public | BindingFlags.Instance
+                                                          | BindingFlags.DeclaredOnly) != null);
     }
 
     // --- decisions -------------------------------------------------------------------
