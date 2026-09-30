@@ -327,11 +327,20 @@ public static class ReplayRecorder
             //    is omitted and a cid that cannot be resolved is absent. Without a version to
             //    branch on, "this mod version did not record it" and "this run could not read
             //    it" are the same missing field.
+            // 7  adds mods, harmony_owners and full_console to the header, and the console,
+            //    autoplay_declined, doom_kill, downgrade, energy, stars and potion_start lines,
+            //    and prepaid_energy / prepaid_stars on an auto-play whose cost was paid first. The
+            //    rest-site offer becomes a decision (decision_type rest_site) and `rest` covers
+            //    all nine options rather than heal and smith. `rest` is now written when the
+            //    option finishes and no longer for Mend's or a mimicked heal, and `transform`
+            //    is written for every transform, after the replacement lands and naming the
+            //    card that actually landed. Those three change what an existing row means, so a
+            //    6 reader counting rests or pairing transforms must branch on this number.
             //
             // The backend rejects a replay_version it has not shipped (400 bad_header against
             // KNOWN_REPLAY_VERSIONS), and on that path the mod marks the journal sent, so the
             // allowlist has to accept 6 before this ships.
-            ?.Set("replay_version", 6)
+            ?.Set("replay_version", 7)
             .Set("run_schema_version", 9)
             .Set("seed", seed)
             // The .run records the bare version ("v0.111.0"); Sts2Version.Current carries the
