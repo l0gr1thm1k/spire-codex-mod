@@ -132,6 +132,12 @@ internal static class ReplayHooks
         _combatFloorKey = null;
         _floorEncounters = null;
         _hpLostInCombat = null;
+        // Combat-lifecycle latches. The recorder has already been bitten by a latch that was
+        // never cleared: quit to menu then Continue in the same process silently dropped every
+        // remaining line of the run. So both of these are cleared on every journal open as well
+        // as at combat_start and when combat_end is written.
+        _combatWon = false;
+        _extraTurnPending = null;
         _selectByInstance = null;
         _selected = null;
         _selectDecision = 0;
@@ -390,6 +396,21 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Events.EventOption"),
                                  "Chosen", me, nameof(EventOptionChosen), 0);
 
+        // --- combat lifecycle --------------------------------------------------------
+        // An extra turn shares its ROUND with the turn it extends: CombatManager.SwitchSides
+        // increments _state.RoundNumber in only one of its two branches while calling
+        // PlayerCombatState.IncrementTurnNumber() in both. Switching turn.n to the player turn
+        // number stops the collision; this hook is what still names the extra turn as one.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterTakingExtraTurn", me, nameof(ExtraTurnTaken));
+        // Deaths, including the ones no damage event can see (Doom, a direct CreatureCmd.Kill, a
+        // self-destruct move) and the ones that were prevented. The only hook carrying
+        // wasRemovalPrevented.
+        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterDeath", me, nameof(CreatureDied));
+        // Not a Harmony patch, so deliberately outside the tally: a subscription to the game's own
+        // CombatEnded / CombatWon events, which are the only end-of-combat notification that fires
+        // on the loss path as well as the win. See BindCombatEndEvents.
+        BindCombatEndEvents();
+
         // Not Harmony patches, so deliberately outside the n/attempted tally: these are plain
         // member lookups whose absence costs two fields on one row, not a whole line kind.
         // The Player argument for the overload match comes from the first pick, so IsMe
@@ -630,6 +651,12 @@ internal static class ReplayHooks
     {
         try
         {
+            // Cleared BEFORE the early return below, so a fight this session never recorded
+            // (recording toggled off mid-run) cannot leave the previous fight's victory flag or
+            // an unconsumed extra-turn mark behind for a later one to read.
+            _combatWon = false;
+            _extraTurnPending = null;
+
             var line = ReplayRecorder.Line("combat_start");
             if (line == null) return;
 
@@ -690,55 +717,62 @@ internal static class ReplayHooks
         catch { }
     }
 
-    private static void CombatEnd(object __1)
-    {
-        try
-        {
-            ReplayRecorder.Line("combat_end")
-                // "victory" is a RECORDED fact here, not a default.
-                //
-                // CombatManager.CheckWinCondition tests the pending loss FIRST and routes it to
-                // ProcessPendingLoss(), which never calls EndCombatInternal() and so never fires
-                // this hook. Only the ending path reaches EndCombatInternal, which fires
-                // AfterCombatEnd and then AfterCombatVictory. There is no loss hook at all:
-                // AfterCombatEnd / AfterCombatVictory / AfterCombatVictoryEarly are the only
-                // combat-end hooks the game has.
-                //
-                // So this line existing IS the victory, and a combat_start with no combat_end
-                // is a loss or an interruption. That is why the value is constant and still
-                // honest: the absence carries the other half of the information.
-                ?.Set("result", "victory")
-                .Set("combat_id", _combatId)
-                .Set("attempt_id", ReplayRecorder.AttemptId)
-                .Set("turns", Reflect.GetInt(__1, "RoundNumber", 0))
-                // Omitted, never 0, when the fight was already under way before this journal
-                // session opened. A fight with no end line at all keeps no total either, which
-                // is what makes "interrupted" readable rather than looking like a clean 0.
-                .Set("hp_lost_total", _hpLostInCombat)
-                .Emit();
-            _combatId = null;
-            _hpLostInCombat = null;
-        }
-        catch { }
-    }
+    // Hook.AfterCombatEnd(IRunState runState, ICombatState? combatState, CombatRoom room) --
+    // the VICTORY half. __1 is the combat state.
+    //
+    // Still emitted from the hook rather than only from the CombatEnded subscription below,
+    // because of WHERE in the file the row lands. This hook runs early inside EndCombatInternal,
+    // before the victory rewards and before the end-of-combat relic effects (Burning Blood's
+    // heal, Meat on the Bone), while CombatEnded fires at the very last statement of that same
+    // method. Moving the win row to the event would pull those heals INSIDE the fight's row
+    // range and break "HP that moved between combat_start and combat_end is HP the fight cost".
+    // The loss path never reaches this hook, and on the win path the subscription finds the
+    // fight already closed.
+    //
+    // (The comment that used to live here named "AfterCombatVictoryEarly" as one of the game's
+    // combat-end hooks. It is not one: it is AbstractModel.AfterCombatVictoryEarly, dispatched
+    // inside Hook.AfterCombatVictory. That static does exist and is not patched.)
+    private static void CombatEnd(object __1) => EmitCombatEnd(__1, won: true);
 
-    private static void PlayerTurnStart(object __0)
+    // Hook.AfterPlayerTurnStart(ICombatState combatState, PlayerChoiceContext choiceContext,
+    // Player player). Fires once per player, from SetupPlayerTurn after that player's hand draw,
+    // so __2 is the player whose turn this row is about.
+    private static void PlayerTurnStart(object __0, object __2)
     {
         try
         {
+            var extra = TakeExtraTurnMark(__2);
             ReplayRecorder.Line("turn")
                 // attempt_id too, so a turn is self-describing. combat_id alone pools the turns
                 // of a fight that was reloaded and retried under one id, and only file position
                 // separated them.
                 ?.Set("combat_id", _combatId)
                 .Set("attempt_id", _combatId == null ? (int?)null : ReplayRecorder.AttemptId)
-                .Set("n", Reflect.GetInt(__0, "RoundNumber", 0))
+                // PlayerCombatState.TurnNumber, NOT ICombatState.RoundNumber.
+                //
+                // CombatManager.SwitchSides increments _state.RoundNumber in only one of its two
+                // branches while calling PlayerCombatState.IncrementTurnNumber() in both, so an
+                // extra turn reused the round its parent turn already had: 217 player turn rows
+                // in the corpus duplicate an existing (combat_id, attempt_id, n) and are
+                // indistinguishable from a row emitted twice. RoundNumber carries the game's own
+                // warning, "BE CAREFUL! You usually want PlayerCombatState.TurnNumber instead of
+                // this", and EndCombatInternal uses TurnNumber for its own turnsTaken.
+                .Set("n", TurnNumberOf(__2))
+                // The round the turn belongs to, kept as its own field rather than discarded.
+                // Two player turns sharing one round is now readable instead of a collision.
+                .Set("round", RoundOf(__0))
+                // Written only when the game said so, via Hook.AfterTakingExtraTurn. Absent is an
+                // ordinary turn. If that hook is ever renamed the marker goes quiet but `n` stays
+                // correct, and n running ahead of round still shows an extra turn was taken.
+                .Set("extra", extra ? (bool?)true : null)
                 .Set("side", "player")
                 .Emit();
         }
         catch { }
     }
 
+    // Hook.AfterSideTurnStart(ICombatState combatState, CombatSide side,
+    // IReadOnlyList<Creature> participants).
     private static void SideTurnStart(object __0, object __1)
     {
         try
@@ -751,23 +785,297 @@ internal static class ReplayHooks
                 // separated them.
                 ?.Set("combat_id", _combatId)
                 .Set("attempt_id", _combatId == null ? (int?)null : ReplayRecorder.AttemptId)
-                .Set("n", Reflect.GetInt(__0, "RoundNumber", 0))
+                // Same meaning as on a player turn row, so `n` means one thing on every turn and
+                // end_turn row: the local player's turn counter. An enemy turn is not handed a
+                // Player, so it is read off the combat state's player list instead.
+                .Set("n", LocalTurnNumber(__0))
+                .Set("round", RoundOf(__0))
                 .Set("side", side)
                 .Emit();
         }
         catch { }
     }
 
+    // Hook.AfterTurnEnd(ICombatState combatState, CombatSide side,
+    // IEnumerable<Creature> participants).
     private static void TurnEnd(object __0, object __1)
     {
         try
         {
             ReplayRecorder.Line("end_turn")
-                ?.Set("n", Reflect.GetInt(__0, "RoundNumber", 0))
+                ?.Set("n", LocalTurnNumber(__0))
+                .Set("round", RoundOf(__0))
                 .Set("side", __1?.ToString()?.ToLowerInvariant())
                 .Emit();
         }
         catch { }
+    }
+
+    // --- combat lifecycle ------------------------------------------------------------
+    //
+    // Everything below closes the two holes the fight boundary had: a loss produced no end row
+    // at all, and a death was only ever visible as a flag on a damage row.
+
+    // Set by the CombatWon subscription, read by EmitCombatEnd. Decides the LABEL only; it is not
+    // the idempotence latch (see EmitCombatEnd). Cleared at combat_start and on journal open.
+    private static bool _combatWon;
+
+    // Players handed an extra turn by Hook.AfterTakingExtraTurn and not yet named on a turn row.
+    //
+    // A list of references rather than a bool, because in co-op two players can both be granted an
+    // extra turn in one SwitchFromPlayerToEnemySide and Hook.AfterPlayerTurnStart then fires once
+    // per player. Matched by reference identity, so nothing rests on whatever equality Player
+    // defines.
+    //
+    // Cleared at combat_start, when combat_end is written, and on every journal open. StartTurn
+    // returns early when combat is no longer in progress, so a granted extra turn whose turn row
+    // never arrives would otherwise mark the first turn of a LATER fight.
+    private static List<object>? _extraTurnPending;
+
+    // The delegates this mod has installed on CombatManager's events, kept so a re-bind can remove
+    // them first. Null until BindCombatEndEvents succeeds.
+    private static Delegate? _onCombatEnded;
+    private static Delegate? _onCombatWon;
+
+    // Hook.AfterTakingExtraTurn(ICombatState combatState, Player player). __1 is the player.
+    //
+    // Fired from SwitchFromPlayerToEnemySide AFTER SwitchSides() has already incremented this
+    // player's TurnNumber and BEFORE StartTurn, so the next turn row for this player is the extra
+    // one and it already carries the right number.
+    //
+    // PREFIX. Hook.AfterTakingExtraTurn is `async Task`, so a postfix would run at its first
+    // await rather than at completion, and nothing here depends on the hook body having run.
+    private static void ExtraTurnTaken(object __1)
+    {
+        try
+        {
+            if (__1 == null) return;
+            (_extraTurnPending ??= new List<object>()).Add(__1);
+        }
+        catch { }
+    }
+
+    // Hook.AfterDeath(IRunState runState, ICombatState? combatState, Creature creature,
+    // bool wasRemovalPrevented, float deathAnimLength). __2 is the creature, __3 the flag.
+    //
+    // The first witness a death has of its own. Until now the only record was `killed: true` on a
+    // hit row, and DamageResult.WasTargetKilled is documented as true "even if the creature was
+    // resurrected afterwards (Fairy in a Bottle, etc.)", so a prevented death was recorded as a
+    // death with no correcting row. Deaths with no damage event at all -- Doom, a direct
+    // CreatureCmd.Kill, a self-destruct move -- produced nothing whatsoever.
+    //
+    // PREFIX, not postfix: Hook.AfterDeath is `async Task` (and its body awaits every listener),
+    // so a postfix fires at the first await. Nothing read here is produced by the hook body --
+    // CreatureCmd.KillWithoutCheckingWinCondition has already resolved the outcome and passes it
+    // in -- so the prefix sees the final values.
+    //
+    // Deliberately NOT deduplicated per creature. KillWithoutCheckingWinCondition fires this with
+    // wasRemovalPrevented: true when Hook.ShouldDie is vetoed, then recurses and fires it again
+    // with false if the creature is still dead, so one killing blow can legitimately produce a
+    // prevented row followed by a real one. Collapsing them would throw away the distinction the
+    // row exists to make.
+    //
+    // A NEW row rather than a field on `hit`: the two are not the same event. A death can have no
+    // damage event behind it, and a damage event can have two deaths behind it.
+    private static void CreatureDied(object __2, bool __3)
+    {
+        try
+        {
+            ReplayRecorder.Line("death")
+                // Same convention as the power row's target: "player", a bare monster id, or
+                // "effect" / "unknown" when the body cannot be named.
+                ?.Set("tgt", CreatureRef(__2))
+                // Which body. Two of the same monster share one `tgt`, so without this the kill
+                // order in a multi-enemy fight still is not recoverable.
+                .Set("tgt_cid", CreatureSlots.Maybe(__2))
+                // SetFlag, not Set: false is the entire point of the row. `true` is a death that
+                // was prevented, which is the correcting row for a `killed: true` hit whose target
+                // is still standing. `false` is a body that really left. A dropped false would
+                // read as "really died", which is the wrong half to guess.
+                .SetFlag("removal_prevented", __3)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CombatManager.CombatWon(CombatRoom). Fires from EndCombatInternal a few statements ahead of
+    // CombatEnded with no await between them, so it is always observed first.
+    //
+    // This is what stops `result` being a hardcoded constant. On the paths the game takes today
+    // the win row is written by the AfterCombatEnd hook and this flag is never read, but if a game
+    // patch renames that hook the event below becomes the only emitter, and then this is the
+    // difference between labelling every victory a loss and labelling it correctly.
+    private static void CombatWonEvent(object room) => _combatWon = true;
+
+    // CombatManager.CombatEnded(CombatRoom) -- the LOSS half, and the fact that combat ended.
+    //
+    // CombatManager.LoseCombat() only sets _pendingLoss. CheckWinCondition() tests it FIRST and
+    // routes it to the private ProcessPendingLoss(), which sets IsInProgress = false and fires
+    // this event but never calls EndCombatInternal(), so Hook.AfterCombatEnd never runs on a loss
+    // and the game has no loss hook anywhere. 878 of the 2822 fights in the corpus had no end row
+    // of any kind for that reason, with losses, reloads, mid-fight quits and truncated files all
+    // collapsed into the same indistinguishable shape.
+    //
+    // The event's argument is the CombatRoom, so the combat state comes off it rather than being
+    // looked up: CombatRoom.CombatState is set in the constructor and is still live here on both
+    // paths (ProcessPendingLoss does not clear it, and EndCombatInternal fires this event under an
+    // explicit `_state != null` guard).
+    private static void CombatEndedEvent(object room)
+    {
+        try
+        {
+            EmitCombatEnd(Reflect.GetMember(room, "CombatState"), _combatWon);
+        }
+        catch { }
+    }
+
+    // The single writer of combat_end, reached from the hook on a win and from the event on a loss.
+    //
+    // _combatId is BOTH the open-fight guard and the idempotence latch. Whichever emitter arrives
+    // first clears it, so the second writes nothing: exactly one row per fight even if
+    // CheckWinCondition is re-entered, or if a loss is queued during EndCombatInternal's awaits
+    // and processed after the win row was already written. The same check refuses an event that
+    // arrives with no fight open. (On the teardown question specifically: CombatEnded is invoked
+    // from exactly two places in the v0.111.0 assembly, ProcessPendingLoss and the last statement
+    // of EndCombatInternal. CombatManager.Reset(bool), which is what a run abandon and an exit
+    // call, does not fire it.)
+    private static void EmitCombatEnd(object? combatState, bool won)
+    {
+        try
+        {
+            if (_combatId == null) return;
+            ReplayRecorder.Line("combat_end")
+                // A recorded outcome, not a constant: "victory" is the game reaching
+                // EndCombatInternal, "loss" is it reaching ProcessPendingLoss instead.
+                ?.Set("result", won ? "victory" : "loss")
+                .Set("combat_id", _combatId)
+                .Set("attempt_id", ReplayRecorder.AttemptId)
+                // The local player's own turn count, which is the number EndCombatInternal itself
+                // stores as turnsTaken. This used to be ICombatState.RoundNumber, which does not
+                // move for an extra turn and so under-reported every fight that had one.
+                .Set("turns", LocalTurnNumber(combatState))
+                // Kept beside it rather than dropped: it is the value released journals carry
+                // under `turns`, and it is still the right count of enemy turns.
+                .Set("rounds", RoundOf(combatState))
+                // Omitted, never 0, when the fight was already under way before this journal
+                // session opened. A fight with no end line at all keeps no total either, which
+                // is what makes "interrupted" readable rather than looking like a clean 0.
+                .Set("hp_lost_total", _hpLostInCombat)
+                .Emit();
+            _combatId = null;
+            _hpLostInCombat = null;
+            _extraTurnPending = null;
+        }
+        catch { }
+    }
+
+    // Subscribe to CombatManager's two end-of-combat events.
+    //
+    // Subscribed ONCE, from Apply, rather than per run. CombatManager.Instance is a process-wide
+    // singleton built by its own static initializer, so it outlives every run: there is no run
+    // boundary at which to re-subscribe and therefore no way for a second run in the same process
+    // to double-subscribe. Rebind also removes the delegate it installed last before adding a new
+    // one, so calling this twice still leaves exactly one subscription. The handlers keep no
+    // subscription-scoped state of their own; they read _combatId, which ResetRun clears on every
+    // journal open.
+    private static void BindCombatEndEvents()
+    {
+        var type = HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.CombatManager");
+        var instance = Reflect.GetStatic(type, "Instance");
+        if (type == null || instance == null)
+        {
+            MainFile.Logger.Info("replay-hooks: CombatManager.Instance not found; "
+                                 + "combat_end will not fire on a loss");
+            return;
+        }
+        _onCombatEnded = Rebind(type, instance, "CombatEnded", nameof(CombatEndedEvent), _onCombatEnded);
+        _onCombatWon = Rebind(type, instance, "CombatWon", nameof(CombatWonEvent), _onCombatWon);
+    }
+
+    // Add one of our handlers to a game event, removing whatever this method installed on a
+    // previous call so the subscription can never stack.
+    //
+    // A C# event subscription is a different mechanism from every other capture point in this
+    // file, and it needs one thing Harmony does not: a delegate of the game's own type. The
+    // handler is declared `void H(object room)` while the event is Action<CombatRoom>, a type the
+    // mod cannot name. Delegate.CreateDelegate's relaxed binding accepts that, because a reference
+    // conversion on a parameter is allowed and CombatRoom converts to object. Verified against
+    // net10 before this was written; a failure throws here and is logged rather than degrading
+    // into a wrong value.
+    private static Delegate? Rebind(Type type, object instance, string eventName,
+                                    string handlerName, Delegate? installed)
+    {
+        try
+        {
+            var evt = type.GetEvent(eventName, BindingFlags.Public | BindingFlags.Instance);
+            if (evt?.EventHandlerType == null)
+            {
+                MainFile.Logger.Info($"replay-hooks: CombatManager.{eventName} not found");
+                return null;
+            }
+            if (installed != null) evt.RemoveEventHandler(instance, installed);
+            var handler = typeof(ReplayHooks).GetMethod(
+                handlerName, BindingFlags.NonPublic | BindingFlags.Static);
+            if (handler == null) return null;
+            var d = Delegate.CreateDelegate(evt.EventHandlerType, handler);
+            evt.AddEventHandler(instance, d);
+            return d;
+        }
+        catch (Exception e)
+        {
+            MainFile.Logger.Info(
+                $"replay-hooks: subscribing to CombatManager.{eventName} failed: {e.Message}");
+            return null;
+        }
+    }
+
+    // ICombatState.RoundNumber, or null when it cannot be read.
+    //
+    // The game documents it as starting at 1, so a 0 is a failed read and the field is omitted
+    // rather than written as a plausible "round zero". That is the whole silent-null trap: a
+    // fallback number here would be indistinguishable from a real count.
+    private static int? RoundOf(object? combatState)
+    {
+        var n = Reflect.GetInt(combatState, "RoundNumber", 0);
+        return n > 0 ? n : (int?)null;
+    }
+
+    // PlayerCombatState.TurnNumber for one player, or null when it cannot be read. Also documented
+    // as starting at 1, so 0 is a failed read and is omitted for the same reason.
+    private static int? TurnNumberOf(object? player)
+    {
+        var pcs = Reflect.GetMember(player, "PlayerCombatState");
+        if (pcs == null) return null;
+        var n = Reflect.GetInt(pcs, "TurnNumber", 0);
+        return n > 0 ? n : (int?)null;
+    }
+
+    // The local player's turn number, for the rows the game does not hand a Player.
+    //
+    // Falls back to the sole player when no net id matches, the same way the rest of the mod
+    // treats single-player: RunManager sets LocalContext.NetId from NetService at run start, so it
+    // is not reliably null off a lobby, and a strict match would drop `n` in single-player.
+    private static int? LocalTurnNumber(object? combatState)
+    {
+        var players = Enumerate(Reflect.GetMember(combatState, "Players")).ToList();
+        if (players.Count == 0) return null;
+        var me = players.FirstOrDefault(p => LocalPlayer.IsLocalPlayer(p))
+                 ?? (players.Count == 1 ? players[0] : null);
+        return TurnNumberOf(me);
+    }
+
+    // Consume the extra-turn mark for one player, if one is waiting for it.
+    private static bool TakeExtraTurnMark(object? player)
+    {
+        var pending = _extraTurnPending;
+        if (pending == null || player == null) return false;
+        for (var i = 0; i < pending.Count; i++)
+        {
+            if (!ReferenceEquals(pending[i], player)) continue;
+            pending.RemoveAt(i);
+            return true;
+        }
+        return false;
     }
 
     // BeforeCardPlayed(ICombatState combatState, CardPlay cardPlay).
