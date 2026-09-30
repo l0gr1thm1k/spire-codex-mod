@@ -274,9 +274,34 @@ internal static class ReplayHooks
         var attempted = 0;
 
         // --- structure ---------------------------------------------------------------
-        attempted++; n += HookPatcher.Patch(harmony, hook, "AfterActEntered", me, nameof(ActEntered));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterMapGenerated", me, nameof(MapGenerated));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterRoomEntered", me, nameof(RoomEntered));
+
+        // --- map ---------------------------------------------------------------------
+        // The act row used to come from Hook.AfterActEntered, which EnterAct awaits LAST, after
+        // the act's first room and a fade. It now comes from SetActInternal, which EnterAct
+        // calls before GenerateMap, so it lands ahead of the map and every room of the act.
+        var runManager = HookPatcher.FindType("MegaCrit.Sts2.Core.Runs.RunManager");
+        attempted++; n += HookPatcher.PatchOn(harmony, runManager, "SetActInternal", me, nameof(ActStarting), 1);
+        // The map node choice. Prefix: VisitedMapCoords still ends at the node we leave.
+        attempted++; n += HookPatcher.PatchOn(harmony, runManager, "EnterMapCoord", me, nameof(MapCoordChosen), 1);
+        // Room exits and the return leg of a nested room. Both private and async; prefixes,
+        // because CurrentRoom is only still the room being left before PopCurrentRoom runs.
+        attempted++; n += HookPatcher.PatchOn(harmony, runManager, "ExitCurrentRoom", me, nameof(RoomExiting), 0);
+        attempted++; n += HookPatcher.PatchOn(harmony, runManager, "ResumePreviousRoom", me, nameof(RoomResuming), 0);
+        // MapRoom never reaches Hook.AfterRoomEntered, so the map screen needs its own patch.
+        // Concrete and synchronous on MapRoom, so it fires for nothing else.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Rooms.MapRoom"),
+            "EnterInternal", me, nameof(MapRoomEntered), 2);
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.MapCmd"),
+            "SetBossEncounter", me, nameof(BossSwapped), 2);
+        // Quest marks added after the map row was written (SpoilsMap marks inside
+        // AfterMapGenerated, which the map row is a prefix on). Sync void, so postfix.
+        var mapPoint = HookPatcher.FindType("MegaCrit.Sts2.Core.Map.MapPoint");
+        attempted++; n += HookPatcher.PatchOn(harmony, mapPoint, "AddQuest", me, nameof(QuestAdded), 1, postfix: true);
+        attempted++; n += HookPatcher.PatchOn(harmony, mapPoint, "RemoveQuest", me, nameof(QuestRemoved), 1, postfix: true);
 
         // --- combat ------------------------------------------------------------------
         attempted++; n += HookPatcher.Patch(harmony, hook, "BeforeCombatStart", me, nameof(CombatStart));
@@ -786,29 +811,20 @@ internal static class ReplayHooks
 
     // --- structure -------------------------------------------------------------------
 
-    private static void ActEntered(object __0)
-    {
-        try
-        {
-            // The act NUMBER is already stamped on every line by ReplayRecorder.Line; only
-            // the act's identity is added here. CurrentAct/Id came back null in the first real
-            // journal, so try the room's act model as well before giving up.
-            ReplayRecorder.Line("act")
-                ?.Set("name", Ids.Bare(Reflect.GetString(Reflect.GetMember(__0, "CurrentAct"), "Id"))
-                              ?? Ids.Bare(Reflect.GetString(Reflect.GetMember(__0, "Act"), "Id"))
-                              ?? Ids.Bare(Reflect.GetString(__0, "CurrentActId")))
-                .Emit();
-        }
-        catch { }
-    }
-
     private static ReplayLine MapNode(object node)
-        => new ReplayLine("n")
+    {
+        var line = new ReplayLine("n")
             .Set("coord", Coord(Reflect.GetMember(node, "coord")))
             .Set("kind", Reflect.GetMember(node, "PointType")?.ToString()?.ToLowerInvariant())
             .Set("children", Enumerate(Reflect.GetMember(node, "Children"))
                 .Select(c => Coord(Reflect.GetMember(c, "coord")) ?? "")
                 .ToList());
+        // MapPoint.Quests: FurCoat's 1 HP fights, SpoilsMap's treasure. Only present when marked;
+        // marks added after this row are `quest` rows (see QuestAdded).
+        var quests = QuestIds(node);
+        if (quests.Count > 0) line.Set("quests", quests);
+        return line;
+    }
 
     // AfterMapGenerated(IRunState, ActMap map, int actIndex) — the whole act map, so a replay
     // can draw the graph and the path taken through it. One line per act.
@@ -816,6 +832,7 @@ internal static class ReplayHooks
     {
         try
         {
+            FlushPendingAct(__0, __2);
             var line = ReplayRecorder.Line("map");
             if (line == null) return;
             // ActMap exposes GetAllMapPoints(), not a Points/Nodes property, and MapPoint
@@ -877,6 +894,13 @@ internal static class ReplayHooks
                     Reflect.GetMember(__1, "SecondBossMapPoint"), "coord")))
                 .Set("nodes", nodes)
                 .Emit();
+            // The points this row described, so a quest mark landing on one of them later is
+            // written as a row, and one landing on a map not yet written is left to its map row.
+            var points = new HashSet<object>(ReferenceEqualityComparer.Instance);
+            foreach (var node in Enumerate(Reflect.Call(__1, "GetAllMapPoints"))) points.Add(node);
+            foreach (var extra in new[] { "StartingMapPoint", "BossMapPoint", "SecondBossMapPoint" })
+                if (Reflect.GetMember(__1, extra) is { } point) points.Add(point);
+            _mapPoints = points;
         }
         catch { }
     }
@@ -935,9 +959,16 @@ internal static class ReplayHooks
             // Latch it before building the line, so every line until the next room (combat_start
             // above all, which fires immediately after this) carries the right floor.
             ReplayRecorder.NoteFloor(floor, Reflect.GetInt(__0, "CurrentActIndex", 0) + 1);
+            _resumeFrom = null;
+            // Room stack depth with this room on it. 1 is a room entered from the map; 2+ is a
+            // room pushed on top of one (Dense Vegetation's fight inside its event).
+            var depth = Reflect.GetMember(__0, "CurrentRoomCount") is int d ? d : (int?)null;
             ReplayRecorder.Line("room")
                 ?.Set("kind", kind)
                 .Set("room_type", roomType)
+                .Set("depth", depth)
+                // The map point's type, so a "?" that resolved to a fight is not a monster node.
+                .Set("point_type", depth == 1 ? PointTypeOf(__0, __1) : null)
                 .Set("floor", floor >= 0 ? floor : (int?)null)
                 // Which map node this room is, in the same coord space as the map line. Without
                 // it the route is ambiguous wherever a row holds two nodes of the same kind,
@@ -945,6 +976,234 @@ internal static class ReplayHooks
                 .Set("coord", Coord(Reflect.GetMember(__0, "CurrentMapCoord")))
                 .Set("id", Ids.Bare(Reflect.GetString(Reflect.GetMember(__1, "CanonicalEvent"), "Id"))
                            ?? Ids.Bare(Reflect.GetString(__1, "ModelId")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // --- map -------------------------------------------------------------------------
+
+    // Points of the last map row written. See MapGenerated and QuestAdded.
+    private static HashSet<object>? _mapPoints;
+
+    // The room ResumePreviousRoom is about to leave, so its exit can be followed by the resume.
+    // Matched by reference, so a latch left behind can only ever match that same room.
+    private static object? _resumeFrom;
+
+    // An act row that could not be written because no journal was open yet. On a new run the
+    // journal opens from a snapshot tick, which can land between SetActInternal and the map.
+    // Deliberately not cleared by ResetRun: that runs on journal open, the very moment it is
+    // waiting for. Keyed to the run state so it cannot surface in another run.
+    private static (object State, int Index, string? Name)? _pendingAct;
+
+    private static string RoomKind(object room)
+        => room.GetType().Name.Replace("Room", "").ToLowerInvariant();
+
+    private static List<string> QuestIds(object point)
+        => Enumerate(Reflect.GetMember(point, "Quests"))
+            .Select(q => Ids.Bare(Reflect.GetString(q, "Id")))
+            .Where(id => id != null).Select(id => id!).ToList();
+
+    // RunManager.SetActInternal(int actIndex) prefix. CurrentActIndex is still the old act here,
+    // so the act number and model come from the argument. Also latches the act, so rows between
+    // here and the act's first room stop carrying the previous act.
+    private static void ActStarting(object __instance, int __0)
+    {
+        try
+        {
+            var state = Reflect.GetMember(__instance, "State");
+            if (state == null) return;
+            var name = Ids.Bare(Reflect.GetString(ElementAt(Reflect.GetMember(state, "Acts"), __0), "Id"));
+            ReplayRecorder.NoteFloor(-1, __0 + 1);
+            _pendingAct = null;
+            if (ReplayRecorder.Line("act") is { } line)
+                line.Set("act", __0 + 1).Set("name", name).Emit();
+            else
+                _pendingAct = (state, __0, name);
+        }
+        catch { }
+    }
+
+    // Called from MapGenerated, which SetActInternal reaches through GenerateMap. Always
+    // consumes the latch: any later map generation is Golden Compass or a reload, not an act start.
+    private static void FlushPendingAct(object runState, int actIndex)
+    {
+        var pending = _pendingAct;
+        _pendingAct = null;
+        if (pending is not { } p || !ReferenceEquals(p.State, runState) || p.Index != actIndex) return;
+        ReplayRecorder.Line("act")?.Set("act", actIndex + 1).Set("name", p.Name).Emit();
+    }
+
+    // The map point type of the room being entered, from the game's own map point history.
+    // Only trusted when that history entry is this room's: EnterMapPointInternal appends it just
+    // before entering, but a room entered without a map point (The Architect) would otherwise
+    // inherit the boss point's entry.
+    private static string? PointTypeOf(object runState, object room)
+    {
+        var entry = Reflect.GetMember(runState, "CurrentMapPointHistoryEntry");
+        var first = Enumerate(Reflect.GetMember(entry, "Rooms")).FirstOrDefault();
+        if (first == null) return null;
+        var roomType = Reflect.GetString(room, "RoomType");
+        if (roomType == null || Reflect.GetString(first, "RoomType") != roomType) return null;
+        if (Reflect.GetString(first, "ModelId") != Reflect.GetString(room, "ModelId")) return null;
+        return Reflect.GetString(entry, "MapPointType")?.ToLowerInvariant();
+    }
+
+    // RunManager.EnterMapCoord(MapCoord) prefix. The offer is computed here rather than by
+    // patching MapTravel.GetTravelablePointsFrom, which NMapScreen calls on every visual refresh.
+    // Mirrors NMapScreen's travelable rules: the act's first node, the node after the last row
+    // and the second boss are forced moves, and so is a node with one way on. None of those are
+    // written; the room row still records where the player went.
+    private static void MapCoordChosen(object __instance, object __0)
+    {
+        try
+        {
+            var state = Reflect.GetMember(__instance, "State");
+            var map = Reflect.GetMember(state, "Map");
+            var pick = Coord(__0);
+            if (map == null || pick == null) return;
+            var visited = Enumerate(Reflect.GetMember(state, "VisitedMapCoords")).Select(Coord).ToList();
+            // EnterMapCoord no-ops on an already visited coord.
+            if (visited.Count == 0 || visited.Contains(pick)) return;
+
+            var from = Reflect.GetMember(state, "CurrentMapPoint");
+            if (from == null || ReferenceEquals(from, Reflect.GetMember(map, "BossMapPoint"))) return;
+            if (Reflect.GetMember(Reflect.GetMember(from, "coord"), "row") is not int fromRow
+                || Reflect.Call(map, "GetRowCount") is not int rows
+                || fromRow == rows - 1) return;
+
+            var mapTravel = HookPatcher.FindType("MegaCrit.Sts2.Core.Map.MapTravel");
+            var offer = mapTravel?.GetMethod("GetTravelablePointsFrom", BindingFlags.Public | BindingFlags.Static)
+                ?.Invoke(null, new[] { state, from });
+            var coords = Enumerate(offer)
+                .Select(p => Reflect.GetMember(p, "coord"))
+                .OrderBy(c => Reflect.GetMember(c, "col") is int col ? col : int.MaxValue)
+                .Select(Coord).Where(c => c != null).Select(c => c!).ToList();
+            if (coords.Count < 2) return;
+
+            if (ReplayRecorder.Line("decision") is not { } line) return;
+            // Its own id and nothing else: a map pick must not demote the open decision, or a
+            // card reward resolved while leaving the room would lose its offer.
+            var id = ReplayRecorder.NextDecisionId();
+            var options = coords.Select((c, i) => new ReplayLine("o")
+                .Set("option_index", i)
+                .Set("option_kind", "map_node")
+                .Set("option_id", c)
+                .SetFlag("presented", true)
+                .SetFlag("selectable", true)).ToList();
+            line.Set("decision_id", id)
+                .Set("decision_type", "map_node")
+                .Set("source", "map")
+                .Set("from", Coord(Reflect.GetMember(from, "coord")))
+                .Set("n_presented", coords.Count)
+                .Set("n_selectable", coords.Count);
+            // WingedBoots and the Flight modifier widen the offer to the whole next row.
+            if (HookPatcher.FindType("MegaCrit.Sts2.Core.Hooks.Hook")
+                    ?.GetMethod("ShouldAllowFreeTravel", BindingFlags.Public | BindingFlags.Static)
+                    ?.Invoke(null, new[] { state }) is bool free)
+                line.SetFlag("free_travel", free);
+            line.Set("options", options).Emit();
+
+            var index = coords.IndexOf(pick);
+            ReplayRecorder.Line("outcome")
+                ?.Set("decision_id", id)
+                .Set("decision_type", "map_node")
+                .Set("outcome", "chosen")
+                .Set("option_index", index >= 0 ? index : (int?)null)
+                .Set("option_id", pick)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // RunManager.ResumePreviousRoom() prefix. Only marks the room; RoomExiting writes the rows so
+    // the exit comes first.
+    private static void RoomResuming(object __instance)
+    {
+        try { _resumeFrom = Reflect.GetMember(Reflect.GetMember(__instance, "State"), "CurrentRoom"); }
+        catch { }
+    }
+
+    // RunManager.ExitCurrentRoom() prefix, before PopCurrentRoom. Fires once per room on the stack
+    // (ExitCurrentRooms loops it), including the map screen.
+    private static void RoomExiting(object __instance)
+    {
+        try
+        {
+            var state = Reflect.GetMember(__instance, "State");
+            var room = Reflect.GetMember(state, "CurrentRoom");
+            var resuming = room != null && ReferenceEquals(room, _resumeFrom);
+            _resumeFrom = null;
+            if (room == null) return;
+            var depth = Reflect.GetMember(state, "CurrentRoomCount") is int d ? d : (int?)null;
+            ReplayRecorder.Line("room_exit")
+                ?.Set("kind", RoomKind(room))
+                .Set("depth", depth)
+                .Emit();
+            if (!resuming || depth is not int dd || dd < 2) return;
+            // Back to the room underneath, which gets no new room row: it is the same visit.
+            var below = ElementAt(Reflect.GetMember(state, "_currentRooms"), dd - 2);
+            if (below == null) return;
+            ReplayRecorder.Line("room_resume")
+                ?.Set("kind", RoomKind(below))
+                .Set("depth", dd - 1)
+                .Set("id", Ids.Bare(Reflect.GetString(Reflect.GetMember(below, "CanonicalEvent"), "Id"))
+                           ?? Ids.Bare(Reflect.GetString(below, "ModelId")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // MapRoom.EnterInternal(IRunState? runState, bool isRestoringRoomStackBase) prefix. The map
+    // screen between acts (and on a reload at an act's start). Its own row kind, not a `room`, so
+    // nothing counting rooms as floors changes. Does not latch the floor: the map room has none.
+    private static void MapRoomEntered(object __0, bool __1)
+    {
+        try
+        {
+            if (__1) return; // MapRoom throws on stack restoration
+            ReplayRecorder.Line("map_room")
+                ?.Set("act", Reflect.GetMember(__0, "CurrentActIndex") is int a ? a + 1 : (int?)null)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // MapCmd.SetBossEncounter(IRunState, EncounterModel) prefix. Nothing in v0.107.1 calls it, so
+    // this is unexercised; the map row's boss is otherwise read once at generation.
+    private static void BossSwapped(object __0, object __1)
+    {
+        try
+        {
+            // ActModel.SetBossEncounter throws for a non-boss, so that swap never happens.
+            if (Reflect.GetString(__1, "RoomType") != "Boss") return;
+            var act = Reflect.GetMember(__0, "Act");
+            var prev = Ids.Bare(Reflect.GetString(Reflect.GetMember(act, "BossEncounter"), "Id"));
+            var boss = Ids.Bare(Reflect.GetString(__1, "Id"));
+            if (boss == null || boss == prev) return;
+            ReplayRecorder.Line("boss_swap")
+                ?.Set("act", Reflect.GetMember(__0, "CurrentActIndex") is int a ? a + 1 : (int?)null)
+                .Set("boss", boss)
+                .Set("prev", prev)
+                .Emit();
+        }
+        catch { }
+    }
+
+    // MapPoint.AddQuest / RemoveQuest postfixes. Only for points of a map row already written;
+    // marks made before it (FurCoat, in ModifyGeneratedMapLate) are in that row's `quests`.
+    private static void QuestAdded(object __instance, object __0) => QuestChanged("add", __instance, __0);
+    private static void QuestRemoved(object __instance, object __0) => QuestChanged("remove", __instance, __0);
+
+    private static void QuestChanged(string op, object point, object model)
+    {
+        try
+        {
+            if (_mapPoints == null || !_mapPoints.Contains(point)) return;
+            ReplayRecorder.Line("quest")
+                ?.Set("op", op)
+                .Set("coord", Coord(Reflect.GetMember(point, "coord")))
+                .Set("id", Ids.Bare(Reflect.GetString(model, "Id")))
                 .Emit();
         }
         catch { }
