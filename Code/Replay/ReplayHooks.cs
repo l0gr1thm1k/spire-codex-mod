@@ -323,6 +323,41 @@ internal static class ReplayHooks
             HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CreatureCmd"),
             "Heal", me, nameof(Healed), 3);
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterCurrentHpChanged", me, nameof(HpChanged));
+
+        // --- max hp and direct hp sets -----------------------------------------------
+        //
+        // Neither has a first-party hook, so both patch CreatureCmd by name and degrade to
+        // "that line kind stops appearing" if a game patch renames them.
+        //
+        // CreatureCmd.SetMaxHp is the single funnel for every max HP move: GainMaxHp and
+        // LoseMaxHp both route through it, and so do SetMaxAndCurrentHp, OstyCmd and
+        // TestSubject's HP scaling. Without it a max HP change is not merely missing, it is
+        // MISLABELLED. GainMaxHp finishes by calling Heal for the delta, so eating a Mango
+        // emits hp src="heal" and cannot be told from a campfire rest; LoseMaxHp damages the
+        // overflow away first, so an event penalty emits a hit. Anything adding HP per floor
+        // counts both of those twice today.
+        //
+        // PREFIX on both, for two reasons. They are `async Task`, so a postfix fires at the
+        // first await rather than at completion (SetMaxHp's is inside its MaxHp <= 0 Kill
+        // branch) and SetMaxHp's __result is the Task, not the decimal delta it returns. And
+        // the BEFORE values are the whole point: a prefix is the last moment the old cap and
+        // the old current HP still exist, and the delta is named from those.
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CreatureCmd"),
+            "SetMaxHp", me, nameof(MaxHpSet), 2);
+        attempted++; n += HookPatcher.PatchOn(harmony,
+            HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CreatureCmd"),
+            "SetCurrentHp", me, nameof(CurrentHpSet), 2);
+        // Not a Harmony patch, so deliberately outside the n/attempted tally. CreatureCmd.Heal
+        // returns without doing anything when combat is ending and the target is not a player,
+        // and now that Healed records monsters too it needs the same guard or it writes a heal
+        // that never landed. An unresolved type reads as "not ending", which writes the row: a
+        // spare row for a discarded monster heal is a smaller lie than dropping every heal.
+        _combatManagerType = HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.CombatManager");
+        if (_combatManagerType == null)
+            MainFile.Logger.Info("replay-hooks: CombatManager not found; a monster heal during "
+                                 + "combat end may emit a spare hp row, and power_lost rows lose post_combat");
+
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterGoldGained", me, nameof(GoldGained));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterOrbChanneled", me, nameof(OrbChanneled));
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterOrbEvoked", me, nameof(OrbEvoked));
@@ -349,9 +384,6 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.PatchOn(harmony,
             HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.History.CombatHistory"),
             "PowerReceived", me, nameof(PowerReceived), 4);
-        // Not a patch, so outside the n/attempted tally: one type lookup, whose absence costs
-        // one tag on one row kind (see PostCombat).
-        _combatManagerType = HookPatcher.FindType("MegaCrit.Sts2.Core.Combat.CombatManager");
 
         // --- decisions ---------------------------------------------------------------
         // The offer itself, with one option row per card and its selectability. Postfix on
@@ -1662,21 +1694,76 @@ internal static class ReplayHooks
         return Reflect.GetMember(mgr, "IsInProgress") is false ? (object)true : null;
     }
 
+    // Current or max HP read STRICTLY: an int or nothing.
+    //
+    // Reflect.GetInt's fallback cannot be used for these. Its default is 0, and 0 HP is a real
+    // value that means dead, so a renamed property would ship "this creature is at 0" on every
+    // row instead of saying nothing. Every caller below bails rather than guess.
+    private static int? HpOf(object? creature, string name)
+        => Reflect.GetMember(creature, name) is int v ? v : (int?)null;
+
+    // Whose HP moved, in co-op only.
+    //
+    // Written only for a player's creature. A monster belongs to neither player, so mine:false
+    // on a monster row would read as "the other player's", which is worse than leaving it off.
+    // Null in single-player, where every player creature is ours and the field would be a
+    // constant, exactly as Mine() already behaves for relic rows.
+    private static bool? MineCreature(object? creature)
+        => Reflect.GetMember(creature, "IsPlayer") is true
+            ? Mine(Reflect.GetMember(creature, "Player"))
+            : (bool?)null;
+
     // CreatureCmd.Heal(creature, amount, playAnim). Patched directly because the game's
     // AfterCurrentHpChanged did not produce an hp line for a rest-site heal, so four rest
     // floors in a real journal recorded the option taken and never the amount. Prefix, so the
     // amount is the one being applied rather than one re-derived after the fact.
+    //
+    // NOT gated on IsPlayer any more. CreatureCmd.Heal is the only caller of
+    // Creature.HealInternal in the whole assembly, so this one prefix is every heal in the
+    // game, and the gate was throwing away all of them that landed on a body other than the
+    // local player: Knowledge Demon's 30-per-player self-heal, Waterfall Giant's Siphon, Test
+    // Subject, Regen and Reattach on a monster, Osty, and the pets Spur heals. Without those a
+    // consumer subtracting hit.dmg from combat_start.hp has the wrong number for that body for
+    // the rest of the fight.
+    //
+    // `mine` is what fixes Mend. MendRestSiteOption.OnSelect heals ANOTHER player -- its own
+    // targeting filter refuses the caster -- so a teammate's Mend used to be recorded as the
+    // local player's HP going up, with nothing on the row to say otherwise. Round Tea Party
+    // heals a chosen player the same way.
+    //
+    // `d` is the HP the creature ACTUALLY gains, not the amount asked for. Creature.HealInternal
+    // clamps at the cap, so the old row claimed a 7-point heal at 78/80 and an hp of 85, a value
+    // the game will never hold. `overheal` carries what was thrown away, so a Regen tick at full
+    // HP is d:0 overheal:3 (a real fact) rather than a silent lie, and the old field is
+    // recoverable as d + overheal.
     private static void Healed(object __0, decimal __1)
     {
         try
         {
-            if (Reflect.GetMember(__0, "IsPlayer") is not true) return;
-            var amount = (int)__1;
-            if (amount == 0) return;
+            // Heal's own first guard: it returns before touching HP when combat is ending and
+            // the target is not a player. Read the same way the game reads it.
+            if (Reflect.GetMember(__0, "IsPlayer") is not true
+                && Reflect.GetMember(
+                       Reflect.GetStatic(_combatManagerType, "Instance"), "IsEnding") is true)
+                return;
+            if (__1 <= 0m) return; // no HP moves and no hook fires for a non-positive amount
+            if (HpOf(__0, "CurrentHp") is not int oldHp) return;
+            if (HpOf(__0, "MaxHp") is not int max) return;
+            // Mirrors Creature.SetCurrentHpInternal, which is what HealInternal calls:
+            // CurrentHp = (int)Math.Min(CurrentHp + amount, MaxHp).
+            var newHp = (int)Math.Min(oldHp + __1, max);
+            var d = newHp - oldHp;
+            // Capped before the cast for the same reason MaxHpSet caps: the game's own ceiling
+            // is 999999999 and an unbounded (int) on a decimal throws rather than saturating.
+            var wasted = (int)Math.Min(__1, 999999999m) - d;
             ReplayRecorder.Line("hp")
-                ?.Set("d", amount)
-                .Set("hp", Reflect.GetInt(__0, "CurrentHp", 0) + amount)
+                ?.Set("dst", CreatureRef(__0))
+                .Set("dst_cid", CreatureSlots.Maybe(__0))
+                .Set("d", d)
+                .Set("hp", newHp)
                 .Set("src", "heal")
+                .Set("overheal", wasted > 0 ? wasted : (int?)null)
+                .Set("mine", MineCreature(__0))
                 .Emit();
         }
         catch { }
@@ -1852,16 +1939,126 @@ internal static class ReplayHooks
             .Set("left", left ?? IntOf(creature, "Block"))
             .Set("reason", reason);
 
-    // AfterCurrentHpChanged(runState, combatState, creature, delta) — every HP delta, not just
-    // combat hits, so event and campfire HP movement is in the record too.
-    private static void HpChanged(object __2, decimal __3)
+    // AfterCurrentHpChanged(runState, combatState, creature, delta). Fires for EVERY creature,
+    // and the game has exactly four callers: CreatureCmd.Damage, Kill, Heal and SetCurrentHp.
+    //
+    // This used to return for anything but the player, which is why no monster HP movement was
+    // ever recorded. But ungating it and emitting everything is worse than the gate, because the
+    // Damage caller fires one of these for every unblocked hit on either side, immediately
+    // before the AfterDamageGiven that the `hit` row is built from. That would put tens of
+    // thousands of rows in the corpus restating damage the journal already states.
+    //
+    // So a row is written only when nothing else already carries the number:
+    //
+    //   delta > 0              DROPPED. Only Heal and SetCurrentHp can raise HP, and both are
+    //                          prefixed above, so each already writes its own row with a src and
+    //                          a dst for every creature.
+    //   delta < 0, in combat   DROPPED. Damage hands this hook the same `combatState` local it
+    //                          gates the AfterDamageGiven call on, so combatState != null is
+    //                          PROOF that a hit row carries this exact number for this exact
+    //                          body. The Kill path's own -currentHp fire goes with it, and it is
+    //                          the one thing this rule gives up: a damage-less death in combat
+    //                          (Doom, The Gambit, a self-destruct, a cap driven to 0) used to
+    //                          leave an hp row for the player and now leaves none. It is not
+    //                          separable from a lethal hit here -- both fire -(HP remaining) and
+    //                          both end at 0 -- and a death is Hook.AfterDeath's row to write,
+    //                          not an hp row's. In combat the player's remaining HP is already
+    //                          combat_start.hp minus the hits, and the death itself is on the
+    //                          terminal line.
+    //   delta < 0, no combat   KEPT. Out of combat AfterDamageGiven never fires, so no hit row
+    //                          exists at all, and AfterDamageReceived is skipped when the blow
+    //                          was fatal, so hp_loss is not always there either. A fatal event
+    //                          hit has no other witness anywhere in the file.
+    //
+    // __1 is the combat state and __2 the creature. Confirmed against the hook's own signature
+    // rather than counted: (IRunState runState, ICombatState? combatState, Creature creature,
+    // decimal delta). One index out and the row would name the run state as the body.
+    private static void HpChanged(object __1, object __2, decimal __3)
     {
         try
         {
-            if (Reflect.GetMember(__2, "IsPlayer") is not true) return;
+            var d = (int)__3;
+            if (d >= 0) return;
+            if (__1 != null) return;
             ReplayRecorder.Line("hp")
-                ?.Set("d", (int)__3)
-                .Set("hp", Reflect.GetInt(__2, "CurrentHp", 0))
+                ?.Set("dst", CreatureRef(__2))
+                .Set("dst_cid", CreatureSlots.Maybe(__2))
+                .Set("d", d)
+                // LoseHpInternal has already run by the time the hook fires, so this is the
+                // post-hit value and the row is a resync point, not a delta to be accumulated.
+                .Set("hp", HpOf(__2, "CurrentHp"))
+                // Named rather than left blank. "loss" is HP gone with this row as its only
+                // witness; heal and set are the two prefixes above. An hp row with no src at all
+                // predates this.
+                .Set("src", "loss")
+                .Set("mine", MineCreature(__2))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // CreatureCmd.SetMaxHp(creature, amount). Every max HP move in the game funnels through
+    // here: GainMaxHp calls it and then heals the delta, LoseMaxHp damages the overflow away and
+    // then calls it, and SetMaxAndCurrentHp, OstyCmd and TestSubject call it directly. So this
+    // one row separates Cook's +9, a Mango and Stone Humidifier from a campfire rest, and
+    // Brightest Flame, Tablet of Truth and Night Terrors from combat damage.
+    //
+    // A prefix, so the delta is recomputed the way Creature.SetMaxHpInternal computes it --
+    // Math.Min((int)Math.Max(0, amount), 999999999) against the cap that is still in place --
+    // rather than read back afterwards. There is no afterwards to read from: SetMaxHp is
+    // `async Task<decimal>` and returns the delta, so a postfix would be handed the Task.
+    //
+    // `hp` is here because SetMaxHpInternal assigns CurrentHp = Math.Min(CurrentHp, MaxHp)
+    // DIRECTLY, firing no hook of its own, so a cap dropping below current HP moves current HP
+    // with no witness anywhere. LoseMaxHp normally damages the overflow away first and leaves
+    // nothing to clamp, but SetMaxAndCurrentHp lowering a monster's cap (Tough Egg hatching, a
+    // Decimillipede segment) does not: SetMaxHp clamps it here, so the SetCurrentHp that follows
+    // sees no change and fires nothing. This row is the only place that shows up.
+    private static void MaxHpSet(object __0, decimal __1)
+    {
+        try
+        {
+            if (HpOf(__0, "MaxHp") is not int oldMax) return;
+            // Clamped BEFORE the int cast, not after like the game does it. Same answer for
+            // every value the game passes and no OverflowException on a larger one.
+            var newMax = (int)Math.Min(Math.Max(0m, __1), 999999999m);
+            // Test Subject rescaling to the cap it already has, and the second
+            // SetMaxAndCurrentHp on an already-invincible Waterfall Giant. Nothing moved.
+            if (newMax == oldMax) return;
+            if (ReplayRecorder.Line("max_hp") is not { } line) return;
+            line.Set("dst", CreatureRef(__0))
+                .Set("dst_cid", CreatureSlots.Maybe(__0))
+                .Set("d", newMax - oldMax)
+                .Set("max_hp", newMax);
+            if (HpOf(__0, "CurrentHp") is int cur) line.Set("hp", Math.Min(cur, newMax));
+            line.Set("mine", MineCreature(__0)).Emit();
+        }
+        catch { }
+    }
+
+    // CreatureCmd.SetCurrentHp(creature, amount). A direct assignment, neither damage nor a
+    // heal: Fur Coat marking an enemy down to 1 HP, and the phase transitions that arrive
+    // through SetMaxAndCurrentHp.
+    //
+    // Patched even though SetCurrentHp fires AfterCurrentHpChanged itself, because HpChanged now
+    // drops in-combat losses as restatements of a hit row and a set is not a hit. Prefix for the
+    // same reason as SetMaxHp: async, and the old value only exists before the body runs.
+    private static void CurrentHpSet(object __0, decimal __1)
+    {
+        try
+        {
+            if (HpOf(__0, "CurrentHp") is not int oldHp) return;
+            if (HpOf(__0, "MaxHp") is not int max) return;
+            // Mirrors Creature.SetCurrentHpInternal: CurrentHp = (int)Math.Min(amount, MaxHp).
+            var newHp = (int)Math.Min(__1, max);
+            if (newHp == oldHp) return;
+            ReplayRecorder.Line("hp")
+                ?.Set("dst", CreatureRef(__0))
+                .Set("dst_cid", CreatureSlots.Maybe(__0))
+                .Set("d", newHp - oldHp)
+                .Set("hp", newHp)
+                .Set("src", "set")
+                .Set("mine", MineCreature(__0))
                 .Emit();
         }
         catch { }
