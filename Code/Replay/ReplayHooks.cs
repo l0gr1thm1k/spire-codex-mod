@@ -1679,12 +1679,12 @@ internal static class ReplayHooks
         catch { }
     }
 
-    private static void BlockBroken(object __1)
+    private static void BlockBroken(object __2)
     {
         try
         {
-            if (__1 == null) return;
-            BlockRow(__1, null, "broken").Emit();
+            if (__2 == null) return;
+            BlockRow(__2, null, "broken").Emit();
         }
         catch { }
     }
