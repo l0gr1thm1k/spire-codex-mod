@@ -556,6 +556,12 @@ internal static class ReplayHooks
         // Deck mutations that instance lineage depends on.
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
                                  "Upgrade", me, nameof(CardUpgraded), 2, firstParamType: "CardModel");
+        // Downgrade is synchronous and silently does nothing while a combat is ending, so it is
+        // read on both sides: the level going in, and the row only if it came down.
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "Downgrade", me, nameof(DowngradeStarting), 1);
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "Downgrade", me, nameof(CardDowngraded), 1, postfix: true);
 
         // --- transforms ---
         //
@@ -3961,6 +3967,46 @@ internal static class ReplayHooks
                 .Set("option_index", offered ? SelectIndexOf(__0) : null)
                 .Set("c", CardInstances.Of(__0))
                 .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Emit();
+        }
+        catch { }
+    }
+
+    // The upgrade level of the card CardCmd.Downgrade was just handed.
+    private static int _levelBeforeDowngrade;
+
+    private static void DowngradeStarting(object __0)
+    {
+        try { _levelBeforeDowngrade = Reflect.GetInt(__0, "CurrentUpgradeLevel", 0); } catch { }
+    }
+
+    // CardCmd.Downgrade(card), postfix. The mirror of the upgrade row, same shape plus the
+    // level it came down from.
+    //
+    // Upgrade wrote a row every time and Downgrade never did, so a downgrade's only witness was
+    // the deck listing on either side of it, and a reader following the stream held the card a
+    // level too high for the rest of the run. Reflections' Touch a Mirror downgrades two cards
+    // and upgrades four, and only one of the two downgrades need show in the deck diff: no diff
+    // can say which card the other was.
+    private static void CardDowngraded(object __0)
+    {
+        try
+        {
+            var before = _levelBeforeDowngrade;
+            _levelBeforeDowngrade = 0;
+            var after = Reflect.GetInt(__0, "CurrentUpgradeLevel", 0);
+            if (after >= before) return; // combat ending, or nothing to take off
+            ReplayRecorder.MarkDeckChanged();
+            ReplayRecorder.Line("downgrade")
+                // Only an event may own a downgrade, and no option_index is ever claimed. No
+                // screen in the game chooses cards to downgrade -- Reflections picks them with
+                // Rng.NextItem -- so a deck select open at the time is not this row's decision,
+                // and looking the card up in it would register a pick the player never made.
+                ?.Set("decision_id", _decisionType == "event" && _decision > 0 ? _decision : (int?)null)
+                .Set("c", CardInstances.Of(__0))
+                .Set("id", Ids.Bare(Reflect.GetString(__0, "Id")))
+                .Set("from_up", before)
+                .Set("up", after)
                 .Emit();
         }
         catch { }
