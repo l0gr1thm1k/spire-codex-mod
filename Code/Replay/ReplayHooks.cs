@@ -301,7 +301,9 @@ internal static class ReplayHooks
         attempted++; n += HookPatcher.Patch(harmony, hook, "AfterCardChangedPiles", me, nameof(CardChangedPiles));
 
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
-                                 "Upgrade", me, nameof(CardUpgraded), 2, firstParamType: "CardModel");
+                                 "Upgrade", me, nameof(UpgradesStarting), 2, firstParamType: "IEnumerable`1");
+        attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
+                                 "Upgrade", me, nameof(UpgradesDone), 2, firstParamType: "IEnumerable`1", postfix: true);
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
                                  "Downgrade", me, nameof(DowngradeStarting), 1);
         attempted++; n += HookPatcher.PatchOn(harmony, HookPatcher.FindType("MegaCrit.Sts2.Core.Commands.CardCmd"),
@@ -2480,6 +2482,29 @@ internal static class ReplayHooks
             if (offered && decisionForCard == _decision) DemoteDecision();
         }
         catch { }
+    }
+
+    private static void UpgradesStarting(object __0, out List<(object Card, int Level)>? __state)
+    {
+        __state = null;
+        try
+        {
+            __state = Enumerate(__0).Select(c => (c, Reflect.GetInt(c, "CurrentUpgradeLevel", 0))).ToList();
+        }
+        catch { }
+    }
+
+    private static void UpgradesDone(List<(object Card, int Level)>? __state)
+    {
+        if (__state == null) return;
+        foreach (var (card, before) in __state)
+        {
+            try
+            {
+                if (Reflect.GetInt(card, "CurrentUpgradeLevel", 0) > before) CardUpgraded(card);
+            }
+            catch { }
+        }
     }
 
     private static void CardUpgraded(object __0)
