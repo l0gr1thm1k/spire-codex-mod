@@ -338,6 +338,10 @@ internal static class ReplayHooks
                                  firstParamType: "CardModel");
         // Hook.ShouldPlay refusals on the autoplay path. Postfix so the out preventer is set.
         attempted++; n += HookPatcher.Patch(harmony, hook, "ShouldPlay", me, nameof(PlayRefused), postfix: true);
+        // The row itself. CardCmd.AutoPlay's four refusal branches all end here, and nothing
+        // else calls it; ShouldPlay is only one of the four.
+        attempted++; n += HookPatcher.PatchOn(harmony, cardCmd, "MoveToResultPileWithoutPlaying", me,
+                                 nameof(AutoPlayDeclined), 2);
         _autoPlayType = HookPatcher.FindType("MegaCrit.Sts2.Core.Entities.Cards.AutoPlayType");
 
         // --- block loss --------------------------------------------------------------
@@ -2062,25 +2066,59 @@ internal static class ReplayHooks
     //
     // CardModel.CanPlay calls this every frame for UI glow, always with AutoPlayType.None
     // (enum value 0), and CardCmd.AutoPlay is the only caller passing anything else. So a
-    // refusal with a non-None type is an autoplay the game then routes to
-    // MoveToResultPileWithoutPlaying with no play row. `int __3` binds the enum without boxing
-    // and `object __2` reads the out value (Harmony derefs a by-ref arg for a by-value param).
+    // refusal with a non-None type is an autoplay the game is about to route to
+    // MoveToResultPileWithoutPlaying. `int __3` binds the enum without boxing and `object __2`
+    // reads the out value (Harmony derefs a by-ref arg for a by-value param).
+    //
+    // Latched, not written: the row comes from AutoPlayDeclined, which sees every refusal, and
+    // this only tells it that the refusal it is looking at was a hook's and whose. A latch left
+    // stale by a veto that never reached AutoPlay can do no worse than fail to match by identity.
     //
     // The manual path is not covered: PlayCardAction re-checks CanPlay after an await and
     // cancels, which leaves the card in hand with nothing spent, and CanPlay itself is too hot
     // to tell that check apart from UI polling.
+    private static object? _vetoedCard;
+    private static object? _vetoPreventer;
+    private static int _vetoAutoType;
+
     private static void PlayRefused(bool __result, object __1, object? __2, int __3)
     {
         if (__result || __3 == 0) return;
+        _vetoedCard = __1;
+        _vetoPreventer = __2;
+        _vetoAutoType = __3;
+    }
+
+    // CardCmd.MoveToResultPileWithoutPlaying(choiceContext, card), prefix. Reached only from
+    // CardCmd.AutoPlay, on each of its four refusals: the card is Unplayable (checked BEFORE
+    // ShouldPlay, so the veto hook never sees it), a hook refused it, or it targets an enemy or
+    // an ally and there is none.
+    //
+    // A refused autoplay otherwise wrote nothing, which reads exactly like a turn on which nothing
+    // was pulled. The Unplayable branch is the common one -- Mayhem or Havoc pulling a status or
+    // curse -- and a reader that misses it credits the next pull to the wrong turn.
+    private static void AutoPlayDeclined(object __1)
+    {
         try
         {
+            var vetoed = ReferenceEquals(__1, _vetoedCard);
+            var reason = Enumerate(Reflect.GetMember(__1, "Keywords"))
+                             .Any(k => k?.ToString() == "Unplayable") ? "unplayable"
+                : vetoed ? "blocked"
+                : "no_target";
+            if (vetoed) _vetoedCard = null;
+            var blocked = reason == "blocked";
+            var kind = blocked && _autoPlayType != null ? Enum.GetName(_autoPlayType, _vetoAutoType) : null;
             var origin = CardInstances.DeckIdOf(__1);
-            var kind = _autoPlayType == null ? null : Enum.GetName(_autoPlayType, __3);
             ReplayRecorder.Line("play_blocked")
                 ?.Set("c", CardInstances.Of(__1))
                 .Set("deck_c", origin > 0 ? origin : (int?)null)
                 .Set("id", Ids.Bare(Reflect.GetString(__1, "Id")))
-                .Set("preventer", Ids.Bare(Reflect.GetString(__2, "Id")))
+                .Set("up", Reflect.GetInt(__1, "CurrentUpgradeLevel", 0))
+                .Set("reason", reason)
+                // Only a hook refusal has a preventer and an autoplay type to report; the other
+                // three branches are decided before or without ShouldPlay.
+                .Set("preventer", blocked ? Ids.Bare(Reflect.GetString(_vetoPreventer, "Id")) : null)
                 .Set("auto_type", kind?.ToLowerInvariant())
                 .Set("mine", Mine(Reflect.GetMember(__1, "Owner")))
                 .Emit();
